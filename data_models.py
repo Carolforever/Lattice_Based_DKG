@@ -34,6 +34,9 @@ class EncryptedSharePackage:
     receiver_id: int
     encrypted_data: bytes
     nonce: bytes
+    kem_public: bytes
+    key_signature: bytes
+    signature: bytes
 
 
 @dataclass
@@ -66,3 +69,15 @@ class Complaint:
     accused_id: int         # 被投诉者ID
     reason: str             # 投诉原因
     timestamp: float        # 投诉时间戳
+    evidence_package: EncryptedSharePackage | None = None  # 原始加密包
+    symmetric_key: bytes | None = None                    # 解密密钥（作为证据发布）
+    sender_key_signature: bytes | None = None             # 发送者对密钥的签名
+    complainer_signature: bytes | None = None              # 投诉者对证据的签名
+
+
+@dataclass
+class ValidationVector:
+    """每个参与者广播的验证结果 / Broadcast of locally accepted sender IDs."""
+
+    participant_id: int
+    accepted_ids: List[int]

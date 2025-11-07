@@ -98,7 +98,6 @@ def test_distributed_v3s() -> None:
     dimension = 4
     sigma_x = 1.0
     sigma_y = sigma_x * (337 ** 0.5)
-    shared_password = "secure_shared_password_for_v3s"
 
     print("*** Protocol Parameters ***")
     print(f"  • Number of participants (N): {num_participants}")
@@ -108,7 +107,7 @@ def test_distributed_v3s() -> None:
     print(f"  • sigma_y:                    {sigma_y:.2f} (= √337 × sigma_x)")
     print(f"  • Prime field size:           2^255 - 19")
     print(f"  • Prime bit length:           {PRIME.bit_length()} bits")
-    print(f"  • Encryption:                 AES-256-GCM with PBKDF2")
+    print(f"  • Encryption:                 X25519 KEM + AES-256-GCM (Ed25519 signatures)")
     print("-" * 80 + "\n")
 
     # —— 模拟网络与参与者线程注册 ——
@@ -123,7 +122,6 @@ def test_distributed_v3s() -> None:
             t=threshold,
             d=dimension,
             network=network,
-            shared_password=shared_password,
             sigma_x=sigma_x,
             sigma_y=sigma_y,
         )
@@ -242,6 +240,12 @@ def test_distributed_v3s() -> None:
             print(f"  Participant {participant.participant_id}: ✗ Failed to reconstruct global secret")
 
     if global_secrets:
+        shares_used = len(global_secrets)
+        rs_correctable = max(0, (shares_used - threshold) // 2)
+        print(
+            f"\n  🛠  Reed–Solomon correction capacity: ⌊(I - T)/2⌋ = {rs_correctable} (I={shares_used}, T={threshold})"
+        )
+
         unique_secrets = list({tuple(s) for s in global_secrets.values()})
         if len(unique_secrets) == 1:
             print(f"\n  ✓ All participants reconstructed the SAME global secret!")
@@ -282,6 +286,9 @@ def test_distributed_v3s() -> None:
         print(f"\n  ⏱  Average global secret reconstruction time: {avg_recon_time*1000:.2f} ms")
     else:
         print(f"\n  ✗ No participants successfully reconstructed the global secret")
+        print(
+            "     (Likely cause: Reed–Solomon decoding detected too many errors and aborted the protocol)"
+        )
 
     print("\n" + "=" * 80)
     print("***  GLOBAL PUBLIC KEY GENERATION  ***".center(80))

@@ -6,12 +6,19 @@ import hashlib
 import random
 import threading
 import time
-from typing import Dict, List
+from typing import Dict, List, Set
 
 import numpy as np
 
 from crypto_manager import CryptoManager
-from data_models import AggregatedShare, Complaint, EncryptedSharePackage, PublicProof, Share
+from data_models import (
+    AggregatedShare,
+    Complaint,
+    EncryptedSharePackage,
+    PublicProof,
+    Share,
+    ValidationVector,
+)
 from network_simulator import NetworkSimulator
 from v3s_core import V3S
 
@@ -26,7 +33,6 @@ class DistributedParticipant(threading.Thread):
         t: int,
         d: int,
         network: NetworkSimulator,
-        shared_password: str,
         sigma_x: float = 1.0,
         sigma_y: float = 18.36,
     ) -> None:
@@ -36,7 +42,7 @@ class DistributedParticipant(threading.Thread):
         self.t = t
         self.d = d
         self.network = network
-        self.shared_password = shared_password
+
         self.sigma_x = sigma_x
         self.sigma_y = sigma_y
 
@@ -49,9 +55,13 @@ class DistributedParticipant(threading.Thread):
         # 存储接收到的份额
         self.received_shares: Dict[int, Dict[str, object]] = {}
         self.received_proofs: Dict[int, Dict[str, object]] = {}
+        self.received_share_packages: Dict[int, EncryptedSharePackage] = {}
+        self.received_share_keys: Dict[int, bytes] = {}
 
-        # 有效份额数组（验证通过的份额）
-        self.valid_shares: List[int] = []  # 存储有效的participant_id列表
+        # 有效份额与验证广播
+        self.valid_shares: List[int] = []  # 最终公共交集
+        self.local_valid_ids: Set[int] = set()  # 本地判定为有效的发送者ID
+        self.received_validation_vectors: Dict[int, List[int]] = {}
 
         # 投诉相关
         self.complaints_sent: List[Complaint] = []
@@ -92,8 +102,14 @@ class DistributedParticipant(threading.Thread):
         self.ready_event = threading.Event()
         self.done_event = threading.Event()
 
-        salt = f"participant_{participant_id}".encode()
-        self.encryption_key = CryptoManager.derive_key(shared_password, salt)
+        self.signing_private_key, self.signing_public_key = CryptoManager.generate_signature_keypair()
+        self.kem_private_key, self.kem_public_key = CryptoManager.generate_kem_keypair()
+
+        self.network.register_participant(
+            self.participant_id,
+            self.signing_public_key,
+            self.kem_public_key,
+        )
 
     def run(self) -> None:  # pragma: no cover - threaded entry point
         """参与者主流程 / Main thread routine for a participant."""
@@ -137,11 +153,13 @@ class DistributedParticipant(threading.Thread):
         if self.share_data is None:
             raise ValueError("Share data must be created before encryption")
 
-        print(f"[Participant {self.participant_id}] Encrypting and sending shares...")
+        print(f"[Participant {self.participant_id}] Encrypting and sending shares with KEM + signatures...")
 
         send_start_time = time.time()
         shares_sent = 0
         encryptions_performed = 0
+        kem_ops = 0
+        signature_ops = 0
 
         for receiver_id in range(1, self.n + 1):
             if receiver_id == self.participant_id:
@@ -149,31 +167,46 @@ class DistributedParticipant(threading.Thread):
 
             # 获取该接收者的份额
             share_info = self.share_data[receiver_id - 1]
+            receiver_kem_public = self.network.get_kem_public_key(receiver_id)
+            context = f"v3s-share-{self.participant_id}-{receiver_id}".encode()
+            symmetric_key, kem_public = CryptoManager.encapsulate_key(receiver_kem_public, context)
+            kem_ops += 1
 
-            # 使用预共享密钥加密
-            salt = f"{self.participant_id}_{receiver_id}".encode()
-            key = CryptoManager.derive_key(self.shared_password, salt)
-
-            encrypted_data, nonce = CryptoManager.encrypt_data(share_info, key)
+            encrypted_data, nonce = CryptoManager.encrypt_data(share_info, symmetric_key)
             encryptions_performed += 1
 
-            # 创建加密包
+            key_binding = CryptoManager.serialize_key_binding(self.participant_id, receiver_id, symmetric_key)
+            key_signature = CryptoManager.sign_message(key_binding, self.signing_private_key)
+            signature_ops += 1
+
             package = EncryptedSharePackage(
                 sender_id=self.participant_id,
                 receiver_id=receiver_id,
                 encrypted_data=encrypted_data,
                 nonce=nonce,
+                kem_public=kem_public,
+                key_signature=key_signature,
+                signature=b"",
             )
 
-            # 通过网络发送
+            serialized = CryptoManager.serialize_share_package(package)
+            signature = CryptoManager.sign_message(serialized, self.signing_private_key)
+            package.signature = signature
+            signature_ops += 1
+
             self.network.send_encrypted_share(package)
             shares_sent += 1
 
         self.network_send_time = time.time() - send_start_time
-        self.network_ops['发送加密份额 (AES-256-GCM加密+网络传输)'] = shares_sent
+        self.network_ops['发送加密份额 (KEM+AES-GCM)'] = shares_sent
         self.network_ops['AES-GCM加密操作 (对称加密保护份额隐私)'] = encryptions_performed
+        self.network_ops['X25519封装操作 (KEM)'] = kem_ops
+        self.network_ops['Ed25519签名 (份额包+密钥绑定)'] = signature_ops
 
-        print(f"[Participant {self.participant_id}] Sent {self.n-1} encrypted shares ({self.network_send_time*1000:.2f} ms)")
+        print(
+            f"[Participant {self.participant_id}] Sent {self.n-1} encrypted shares "
+            f"({self.network_send_time*1000:.2f} ms, KEM ops: {kem_ops}, signatures: {signature_ops})"
+        )
 
     def broadcast_public_proof(self) -> None:
         """广播盐值和公开证明 / Broadcast the Merkle root and proof data."""
@@ -208,6 +241,11 @@ class DistributedParticipant(threading.Thread):
         if self.share_data is None:
             raise ValueError("Share data must be available before receiving others")
 
+        # 重置先前状态
+        self.valid_shares = []
+        self.local_valid_ids.clear()
+        self.received_validation_vectors = {}
+
         print(f"[Participant {self.participant_id}] Receiving shares from other participants...")
 
         receive_start_time = time.time()
@@ -222,17 +260,95 @@ class DistributedParticipant(threading.Thread):
 
         decrypt_start_time = time.time()
         decryptions_performed = 0
+        kem_decaps_ops = 0
+        signature_verifications = 0
 
         for package in encrypted_packages:
             try:
-                # 使用预共享密钥解密
-                salt = f"{package.sender_id}_{self.participant_id}".encode()
-                key = CryptoManager.derive_key(self.shared_password, salt)
+                context = f"v3s-share-{package.sender_id}-{self.participant_id}".encode()
+                symmetric_key = CryptoManager.decapsulate_key(
+                    package.kem_public,
+                    self.kem_private_key,
+                    context,
+                )
+                kem_decaps_ops += 1
+
+                sender_public_key = self.network.get_signing_public_key(package.sender_id)
+                serialized = CryptoManager.serialize_share_package(package)
+                signature_ok = CryptoManager.verify_signature(
+                    package.signature,
+                    serialized,
+                    sender_public_key,
+                )
+                signature_verifications += 1
+
+                key_binding = CryptoManager.serialize_key_binding(
+                    package.sender_id,
+                    package.receiver_id,
+                    symmetric_key,
+                )
+                key_signature_ok = CryptoManager.verify_signature(
+                    package.key_signature,
+                    key_binding,
+                    sender_public_key,
+                )
+                signature_verifications += 1
+
+                self.received_share_packages[package.sender_id] = package
+                self.received_share_keys[package.sender_id] = symmetric_key
+
+                if not signature_ok:
+                    self.local_valid_ids.discard(package.sender_id)
+                    evidence_payload = CryptoManager.serialize_complaint_evidence(package, symmetric_key)
+                    complaint_signature = CryptoManager.sign_message(evidence_payload, self.signing_private_key)
+                    complaint = Complaint(
+                        complainer_id=self.participant_id,
+                        accused_id=package.sender_id,
+                        reason="Invalid share signature",
+                        timestamp=time.time(),
+                        evidence_package=package,
+                        symmetric_key=symmetric_key,
+                        sender_key_signature=package.key_signature,
+                        complainer_signature=complaint_signature,
+                    )
+                    self.network.broadcast_complaint(complaint)
+                    self.complaints_sent.append(complaint)
+                    print(
+                        f"[Participant {self.participant_id}] ✗ Invalid signature on share from Participant {package.sender_id}"
+                    )
+                    print(
+                        f"[Participant {self.participant_id}] 📢 Broadcasting complaint against Participant {package.sender_id}"
+                    )
+                    continue
+
+                if not key_signature_ok:
+                    self.local_valid_ids.discard(package.sender_id)
+                    evidence_payload = CryptoManager.serialize_complaint_evidence(package, symmetric_key)
+                    complaint_signature = CryptoManager.sign_message(evidence_payload, self.signing_private_key)
+                    complaint = Complaint(
+                        complainer_id=self.participant_id,
+                        accused_id=package.sender_id,
+                        reason="Invalid key signature",
+                        timestamp=time.time(),
+                        evidence_package=package,
+                        symmetric_key=symmetric_key,
+                        sender_key_signature=package.key_signature,
+                        complainer_signature=complaint_signature,
+                    )
+                    self.network.broadcast_complaint(complaint)
+                    self.complaints_sent.append(complaint)
+                    print(
+                        f"[Participant {self.participant_id}] ✗ Invalid key signature from Participant {package.sender_id}"
+                    )
+                    print(
+                        f"[Participant {self.participant_id}] 📢 Broadcasting key signature complaint against Participant {package.sender_id}"
+                    )
+                    continue
 
                 share_info = CryptoManager.decrypt_data(
                     package.encrypted_data,
                     package.nonce,
-                    key,
+                    symmetric_key,
                 )
 
                 self.received_shares[package.sender_id] = share_info
@@ -252,6 +368,8 @@ class DistributedParticipant(threading.Thread):
         self.network_receive_time = receive_shares_time + decrypt_time + receive_proofs_time
         self.network_ops['接收加密份额 (网络接收+队列操作)'] = len(encrypted_packages)
         self.network_ops['AES-GCM解密操作 (解密接收到的份额)'] = decryptions_performed
+        self.network_ops['X25519解封装操作 (KEM)'] = kem_decaps_ops
+        self.network_ops['Ed25519验签 (份额包+密钥绑定)'] = signature_verifications
         self.network_ops['接收公开证明 (广播消息接收)'] = len(all_proofs)
 
         print(f"[Participant {self.participant_id}] Received {len(all_proofs)} public proofs ({self.network_receive_time*1000:.2f} ms total)")
@@ -290,21 +408,40 @@ class DistributedParticipant(threading.Thread):
                 self.verification_ops.append(operations)
 
                 if is_valid:
-                    self.valid_shares.append(proof.participant_id)
+                    self.local_valid_ids.add(proof.participant_id)
                     verified_count += 1
-                    print(f"[Participant {self.participant_id}] ✓ Verified share from Participant {proof.participant_id} ({duration*1000:.2f} ms)")
+                    print(
+                        f"[Participant {self.participant_id}] ✓ Verified share from Participant {proof.participant_id} ({duration*1000:.2f} ms)"
+                    )
                 else:
+                    self.local_valid_ids.discard(proof.participant_id)
                     failed_count += 1
+                    package = self.received_share_packages.get(proof.participant_id)
+                    symmetric_key = self.received_share_keys.get(proof.participant_id)
+                    complaint_signature = None
+
+                    if package is not None and symmetric_key is not None:
+                        evidence_payload = CryptoManager.serialize_complaint_evidence(package, symmetric_key)
+                        complaint_signature = CryptoManager.sign_message(evidence_payload, self.signing_private_key)
+
                     complaint = Complaint(
                         complainer_id=self.participant_id,
                         accused_id=proof.participant_id,
                         reason="Share verification failed",
                         timestamp=time.time(),
+                        evidence_package=package,
+                        symmetric_key=symmetric_key,
+                        sender_key_signature=package.key_signature if package else None,
+                        complainer_signature=complaint_signature,
                     )
                     self.network.broadcast_complaint(complaint)
                     self.complaints_sent.append(complaint)
-                    print(f"[Participant {self.participant_id}] ✗ Failed to verify share from Participant {proof.participant_id}")
-                    print(f"[Participant {self.participant_id}] 📢 Broadcasting complaint against Participant {proof.participant_id}")
+                    print(
+                        f"[Participant {self.participant_id}] ✗ Failed to verify share from Participant {proof.participant_id}"
+                    )
+                    print(
+                        f"[Participant {self.participant_id}] 📢 Broadcasting complaint against Participant {proof.participant_id}"
+                    )
 
         print(
             f"[Participant {self.participant_id}] Verification complete: {verified_count} valid, {failed_count} invalid (out of {len(all_proofs)-1})"
@@ -319,14 +456,100 @@ class DistributedParticipant(threading.Thread):
 
             for complaint in received_complaints:
                 self.complaints_received.append(complaint)
+                evidence_verified = False
 
-                if complaint.accused_id in self.valid_shares:
-                    self.valid_shares.remove(complaint.accused_id)
-                    print(
-                        f"[Participant {self.participant_id}] ⚠️  Removed Participant {complaint.accused_id} from valid shares (complained by Participant {complaint.complainer_id})"
+                if (
+                    complaint.evidence_package is not None
+                    and complaint.symmetric_key is not None
+                    and complaint.complainer_signature is not None
+                    and complaint.sender_key_signature is not None
+                ):
+                    package = complaint.evidence_package
+                    symmetric_key = complaint.symmetric_key
+
+                    serialized_package = CryptoManager.serialize_share_package(package)
+                    sender_pub = self.network.get_signing_public_key(package.sender_id)
+                    package_signature_ok = CryptoManager.verify_signature(
+                        package.signature,
+                        serialized_package,
+                        sender_pub,
                     )
 
-        print(f"[Participant {self.participant_id}] Final valid shares: {self.valid_shares} ({len(self.valid_shares)} participants)")
+                    key_binding = CryptoManager.serialize_key_binding(
+                        package.sender_id,
+                        package.receiver_id,
+                        symmetric_key,
+                    )
+                    sender_key_signature_ok = CryptoManager.verify_signature(
+                        complaint.sender_key_signature,
+                        key_binding,
+                        sender_pub,
+                    )
+
+                    complainer_pub = self.network.get_signing_public_key(complaint.complainer_id)
+                    evidence_payload = CryptoManager.serialize_complaint_evidence(package, symmetric_key)
+                    complainer_signature_ok = CryptoManager.verify_signature(
+                        complaint.complainer_signature,
+                        evidence_payload,
+                        complainer_pub,
+                    )
+
+                    if package_signature_ok and sender_key_signature_ok and complainer_signature_ok:
+                        try:
+                            share_info = CryptoManager.decrypt_data(
+                                package.encrypted_data,
+                                package.nonce,
+                                symmetric_key,
+                            )
+                        except Exception as exc:  # pragma: no cover - debugging helper
+                            print(
+                                f"[Participant {self.participant_id}] ⚠️  Failed to decrypt evidence from complaint against Participant {complaint.accused_id}: {exc}"
+                            )
+                        else:
+                            public_proof = None
+                            if package.sender_id == self.participant_id and self.public_proof is not None:
+                                public_proof = self.public_proof
+                            else:
+                                public_proof = self.received_proofs.get(package.sender_id)
+
+                            if public_proof is None:
+                                print(
+                                    f"[Participant {self.participant_id}] ⚠️  Missing public proof for Participant {package.sender_id}, cannot verify complaint evidence"
+                                )
+                            else:
+                                is_valid, _, _ = self.v3s.verify_share(
+                                    complaint.complainer_id,
+                                    public_proof,
+                                    share_info,
+                                )
+                                if not is_valid:
+                                    evidence_verified = True
+                                else:
+                                    print(
+                                        f"[Participant {self.participant_id}] ℹ️  Complaint evidence indicates share from Participant {package.sender_id} is valid"
+                                    )
+                    else:
+                        print(
+                            f"[Participant {self.participant_id}] ⚠️  Invalid signatures in complaint against Participant {complaint.accused_id}"
+                        )
+
+                if evidence_verified:
+                    if complaint.accused_id in self.local_valid_ids:
+                        self.local_valid_ids.remove(complaint.accused_id)
+                        print(
+                            f"[Participant {self.participant_id}] ⚠️  Revoked trust in Participant {complaint.accused_id} after verified complaint by Participant {complaint.complainer_id}"
+                        )
+                else:
+                    print(
+                        f"[Participant {self.participant_id}] ℹ️  Complaint from Participant {complaint.complainer_id} lacked verifiable evidence"
+                    )
+
+        # 广播本地验证结果并收集公共交集
+        self.broadcast_and_collect_validation_vectors()
+
+        print(
+            f"[Participant {self.participant_id}] Final valid shares (intersection): {self.valid_shares} ({len(self.valid_shares)} participants)"
+        )
 
         self.compute_consensus_salt()
         self.aggregate_and_reconstruct_global_secret()
@@ -411,7 +634,7 @@ class DistributedParticipant(threading.Thread):
         receive_time = time.time() - receive_start
         print(f"[Participant {self.participant_id}] Received {len(received_agg_shares)} aggregated shares ({receive_time*1000:.2f} ms)")
 
-        # 步骤5: 使用拉格朗日插值重构全局秘密
+        # 步骤5: 使用Reed–Solomon纠错+插值重构全局秘密
         reconstruction_start = time.time()
 
         available_agg_shares: Dict[int, List[int]] = {self.participant_id: aggregated_shares_d_values}
@@ -426,13 +649,26 @@ class DistributedParticipant(threading.Thread):
             )
             return
 
-        selected_pids = sorted(available_agg_shares.keys())[:self.t]
+        participants_used = sorted(available_agg_shares.keys())
+        correctable_errors = max(0, (len(participants_used) - self.t) // 2)
 
         global_secret_vector: List[int] = []
 
         for dim in range(self.d):
-            shares_for_dim = [Share(value=available_agg_shares[pid][dim], index=pid) for pid in selected_pids]
-            secret_dim = self.v3s.lagrange_interpolate(shares_for_dim)
+            shares_for_dim = [Share(value=available_agg_shares[pid][dim], index=pid) for pid in participants_used]
+
+            try:
+                secret_dim = self.v3s.reed_solomon_reconstruct(shares_for_dim)
+            except ValueError:
+                print(
+                    f"[Participant {self.participant_id}] ❌ Reed–Solomon decoding failed (errors > {correctable_errors})"
+                )
+                print(
+                    f"[Participant {self.participant_id}] Aborting DKG: insufficient clean shares to reconstruct dimension {dim}"
+                )
+                self.reconstruction_time = aggregation_time + broadcast_time + receive_time + (time.time() - reconstruction_start)
+                self.done_event.set()
+                raise
 
             half_prime = self.v3s.prime // 2
             if secret_dim > half_prime:
@@ -448,11 +684,63 @@ class DistributedParticipant(threading.Thread):
 
         print(f"[Participant {self.participant_id}] ✓ Reconstructed global secret: {global_secret_vector}")
         print(f"[Participant {self.participant_id}] Global secret norm: ||S_global|| = {global_norm:.4f}")
-        print(f"[Participant {self.participant_id}] Used {len(selected_pids)} participants: {selected_pids}")
+        print(
+            f"[Participant {self.participant_id}] Used {len(participants_used)} participants: {participants_used}"
+        )
+        print(
+            f"[Participant {self.participant_id}] Reed–Solomon correctable errors ≤ {correctable_errors}"
+        )
         print(f"[Participant {self.participant_id}] Total reconstruction time: {self.reconstruction_time*1000:.2f} ms")
 
         # 步骤6: 基于共识盐值生成公共矩阵并计算公钥
         self.generate_public_matrix_and_compute_keys()
+
+    def broadcast_and_collect_validation_vectors(self) -> None:
+        """广播本地验证结果并根据公共交集更新有效参与者集合."""
+
+        accepted_ids = set(self.local_valid_ids)
+        accepted_ids.add(self.participant_id)
+
+        local_vector = ValidationVector(
+            participant_id=self.participant_id,
+            accepted_ids=sorted(accepted_ids),
+        )
+
+        send_start = time.time()
+        self.network.broadcast_validation_vector(local_vector)
+        broadcast_duration = time.time() - send_start
+        self.network_send_time += broadcast_duration
+        self.network_ops['广播验证结果 (valid_i 集合)'] = 1
+
+        # 记录自己的结果，确保参与交集计算
+        self.received_validation_vectors[self.participant_id] = list(local_vector.accepted_ids)
+
+        # 等待其他参与者广播
+        time.sleep(0.2)
+        receive_start = time.time()
+        vectors = self.network.receive_validation_vectors(self.participant_id, self.n)
+        receive_duration = time.time() - receive_start
+        self.network_receive_time += receive_duration
+
+        for vector in vectors:
+            self.received_validation_vectors[vector.participant_id] = list(vector.accepted_ids)
+
+        if len(self.received_validation_vectors) < self.n:
+            print(
+                f"[Participant {self.participant_id}] ⚠️  Received validation vectors from {len(self.received_validation_vectors)} participants (expected {self.n})"
+            )
+
+        # 计算公共交集
+        if self.received_validation_vectors:
+            common_valid = set(range(1, self.n + 1))
+            common_valid.discard(self.participant_id)
+            for accepted_ids in self.received_validation_vectors.values():
+                common_valid &= set(accepted_ids)
+        else:
+            common_valid = set(self.local_valid_ids)
+
+        self.valid_shares = sorted(common_valid)
+        self.network_ops['接收验证结果 (valid_i 集合)'] = len(vectors)
 
     def generate_public_matrix_and_compute_keys(self) -> None:
         """基于共识盐值生成公共矩阵[I|A]，并计算部分公钥和全局公钥."""

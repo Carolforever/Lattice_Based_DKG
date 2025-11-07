@@ -83,6 +83,107 @@ class V3S:
 
         return int(secret)
 
+    @staticmethod
+    def _solve_linear_system_mod(matrix: List[List[int]], vector: List[int], prime: int) -> List[int]:
+        """Solve a linear system over GF(prime) via Gaussian elimination."""
+        if not matrix:
+            raise ValueError("Empty linear system")
+
+        rows = len(matrix)
+        cols = len(matrix[0])
+        aug = [row[:] + [vector[i] % prime] for i, row in enumerate(matrix)]
+        rank = 0
+
+        for col in range(cols):
+            pivot_row = None
+            for r in range(rank, rows):
+                if aug[r][col] % prime != 0:
+                    pivot_row = r
+                    break
+            if pivot_row is None:
+                continue
+
+            aug[rank], aug[pivot_row] = aug[pivot_row], aug[rank]
+            pivot_inv = pow(aug[rank][col] % prime, prime - 2, prime)
+            for c in range(col, cols + 1):
+                aug[rank][c] = (aug[rank][c] * pivot_inv) % prime
+
+            for r in range(rows):
+                if r != rank and aug[r][col] % prime != 0:
+                    factor = aug[r][col] % prime
+                    for c in range(col, cols + 1):
+                        aug[r][c] = (aug[r][c] - factor * aug[rank][c]) % prime
+
+            rank += 1
+            if rank == cols:
+                break
+
+        solution = [0] * cols
+
+        for row in range(rank - 1, -1, -1):
+            lead_col = None
+            for col in range(cols):
+                if aug[row][col] % prime != 0:
+                    lead_col = col
+                    break
+            if lead_col is None:
+                if aug[row][-1] % prime != 0:
+                    raise ValueError("Inconsistent linear system")
+                continue
+
+            rhs = aug[row][-1]
+            for col in range(lead_col + 1, cols):
+                rhs = (rhs - aug[row][col] * solution[col]) % prime
+            solution[lead_col] = rhs % prime
+
+        for r in range(rows):
+            lhs = 0
+            for c in range(cols):
+                lhs = (lhs + (matrix[r][c] % prime) * solution[c]) % prime
+            if lhs != vector[r] % prime:
+                raise ValueError("Linear system has no solution")
+
+        return solution
+
+    def reed_solomon_reconstruct(self, shares: List[Share]) -> int:
+        """Reconstruct the secret using Reed–Solomon decoding with error correction."""
+        num_shares = len(shares)
+        if num_shares < self.t:
+            raise ValueError("Insufficient shares for reconstruction")
+
+        max_correctable = max(0, (num_shares - self.t) // 2)
+        if max_correctable == 0:
+            return self.lagrange_interpolate(shares[: self.t])
+
+        unknowns = self.t + max_correctable
+        if num_shares < unknowns:
+            return self.lagrange_interpolate(shares[: self.t])
+
+        matrix: List[List[int]] = []
+        vector: List[int] = []
+
+        for share in shares:
+            x_val = share.index % self.prime
+            y_val = share.value % self.prime
+
+            row: List[int] = []
+            x_power = 1
+            for _ in range(self.t):
+                row.append(x_power)
+                x_power = (x_power * x_val) % self.prime
+
+            for error_deg in range(1, max_correctable + 1):
+                term = (-y_val * pow(x_val, error_deg, self.prime)) % self.prime
+                row.append(term)
+
+            matrix.append(row)
+            vector.append(y_val)
+
+        solution = self._solve_linear_system_mod(matrix, vector, self.prime)
+
+        secret = solution[0] % self.prime
+        return int(secret)
+
     def generate_random_matrix(self, d: int, n: int, seed: str) -> np.ndarray:
         random_bytes = hashlib.shake_128(seed.encode()).digest(n * d // 4 + 1)
         matrix = np.zeros((d, n), dtype=int)
