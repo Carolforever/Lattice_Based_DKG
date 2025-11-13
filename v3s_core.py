@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import random
 import time
 from typing import Any, Dict, List, Tuple
 
@@ -12,15 +11,17 @@ import numpy as np
 from constants import PRIME
 from data_models import PerformanceStats, Share
 from merkle import MerkleTree
+from secure_rng import SecureRandom
 
 
 class V3S:
-    def __init__(self, n: int, t: int, prime: int = PRIME, slack_factor: float = 10.0):
+    def __init__(self, n: int, t: int, prime: int = PRIME, slack_factor: float = 10.0, rng: SecureRandom | None = None):
         self.n = n
         self.t = t
         self.prime = prime
         self.slack_factor = slack_factor
         self.performance_stats: List[PerformanceStats] = []
+        self.rng = rng or SecureRandom("v3s-core")
 
     def add_performance_stat(self, phase_name: str, duration: float, operations: Dict[str, int] | None = None) -> None:
         stat = PerformanceStats(phase_name, duration, operations or {})
@@ -206,8 +207,28 @@ class V3S:
                     matrix[i, j] = -1
         return matrix
 
+    def aggregate_v_shares(self, v_shares: List[List[int]]) -> List[int]:
+        if not v_shares:
+            return []
+
+        dimension = len(v_shares[0])
+        aggregated: List[int] = []
+
+        for idx in range(dimension):
+            shares_for_coord = [
+                Share(int(vector[idx]) % self.prime, participant_index + 1)
+                for participant_index, vector in enumerate(v_shares)
+            ]
+
+            reconstructed = self.lagrange_interpolate(shares_for_coord)
+            if reconstructed > self.prime // 2:
+                reconstructed -= self.prime
+            aggregated.append(int(reconstructed))
+
+        return aggregated
+
     def shamir_share(self, secret: int, n: int, t: int) -> List[Share]:
-        coefficients = [secret % self.prime] + [random.randint(-1, 1) for _ in range(t - 1)]
+        coefficients = [secret % self.prime] + [self.rng.randbelow(self.prime) for _ in range(t - 1)]
 
         shares = []
         for i in range(1, n + 1):
@@ -223,7 +244,7 @@ class V3S:
 
         # 步骤1: 生成噪声向量
         start_time = time.time()
-        y_vector = [max(-15, min(15, int(random.gauss(0, sigma_y)))) for _ in range(d)]
+        y_vector = self.rng.gaussian_vector(d, 0.0, sigma_y)
         step1_time = time.time() - start_time
 
         # 步骤2: Shamir秘密共享
@@ -240,14 +261,14 @@ class V3S:
 
         # 步骤3: 构建Merkle树
         start_time = time.time()
-        salt = str(random.getrandbits(128))
+        salt = self.rng.decimal_salt(128)
         leaf_data = []
         salts = []
 
         for participant in range(self.n):
             x_participant = [x_shares[i][participant].value for i in range(d)]
             y_participant = [y_shares[i][participant].value for i in range(d)]
-            participant_salt = str(random.getrandbits(128))
+            participant_salt = self.rng.decimal_salt(128)
             salts.append(participant_salt)
             leaf = '|'.join(map(str, x_participant + y_participant)) + '|' + participant_salt
             leaf_hash = MerkleTree.hash_item(leaf)
@@ -309,6 +330,8 @@ class V3S:
                 v_i.append(int(v_elem))
             v_shares.append(v_i)
 
+        aggregated_v = self.aggregate_v_shares(v_shares)
+
         step5_time = time.time() - start_time
         self.add_performance_stat("验证向量计算", step5_time, {
             "矩阵向量乘法 (计算R·x_i,每个参与者一次)": self.n,
@@ -332,6 +355,7 @@ class V3S:
         public_proof = {
             'h': h,
             'v_shares': v_shares,
+            'aggregated_v': aggregated_v,
             'R': R.tolist(),
             'bound': bound,
             'spectral_norm': spectral_norm,
@@ -396,24 +420,24 @@ class V3S:
 
         operations['线性关系检查 (验证v_i=R·x_i+y_i是否成立)'] = len(v_calc)
 
-    # 步骤3: 验证范数
-        v_public_centered = []
-        half_prime = self.prime // 2
-        centering_ops = 0
+    # 步骤3: 验证聚合向量的范数
+        aggregated_v = public_proof.get('aggregated_v')
+        if aggregated_v is None:
+            aggregated_v = self.aggregate_v_shares(public_proof['v_shares'])
 
-        for val in v_public:
+        half_prime = self.prime // 2
+        aggregated_centered: List[float] = []
+
+        for val in aggregated_v:
             int_val = int(val) % self.prime
             if int_val > half_prime:
-                centered_val = int_val - self.prime
-            else:
-                centered_val = int_val
-            v_public_centered.append(float(centered_val))
-            centering_ops += 1
+                int_val = int_val - self.prime
+            aggregated_centered.append(float(int_val))
 
-        operations['中心化转换 (将模表示转为有符号数,便于计算范数)'] = centering_ops
+        operations['中心化转换 (聚合验证向量)'] = len(aggregated_centered)
 
-        norm = np.linalg.norm(v_public_centered)
-        operations['范数计算 (欧几里得范数||v||₂,检查短向量性质)'] = 1
+        norm = np.linalg.norm(aggregated_centered)
+        operations['范数计算 (聚合v向量||v||₂)'] = 1
 
         duration = time.time() - start_time
 

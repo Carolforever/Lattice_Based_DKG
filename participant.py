@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import random
 import threading
 import time
 from typing import Dict, List, Set
@@ -21,6 +20,7 @@ from data_models import (
 )
 from network_simulator import NetworkSimulator
 from v3s_core import V3S
+from secure_rng import SecureRandom
 
 
 class DistributedParticipant(threading.Thread):
@@ -46,10 +46,12 @@ class DistributedParticipant(threading.Thread):
         self.sigma_x = sigma_x
         self.sigma_y = sigma_y
 
-        self.v3s = V3S(n, t)
+        self.rng = SecureRandom(f"participant-{participant_id}")
+        self.v3s = V3S(n, t, rng=self.rng.derive_child(f"v3s-core-{participant_id}"))
         self.secret_vector: List[int] | None = None
         self.public_proof: Dict[str, object] | None = None
         self.share_data: List[Dict[str, object]] | None = None
+        self.noise_share_vector: List[int] | None = None
         self.x_shares: List[List[Share]] | None = None
 
         # 存储接收到的份额
@@ -68,7 +70,7 @@ class DistributedParticipant(threading.Thread):
         self.complaints_received: List[Complaint] = []
 
         # 盐值相关
-        self.participant_salt = str(random.getrandbits(256))  # 生成256位随机盐值 salt_i
+        self.participant_salt = self.rng.decimal_salt(256)  # 生成256位随机盐值 salt_i
         self.received_salts: Dict[int, str] = {}
         self.consensus_salt: str | None = None
 
@@ -128,7 +130,7 @@ class DistributedParticipant(threading.Thread):
 
     def generate_secret(self) -> None:
         """生成自己的短秘密向量 / Sample the participant's short secret vector."""
-        self.secret_vector = [max(-3, min(3, int(random.gauss(0, self.sigma_x)))) for _ in range(self.d)]
+        self.secret_vector = self.rng.gaussian_vector(self.d, 0.0, self.sigma_x)
         print(f"[Participant {self.participant_id}] Generated secret vector: {self.secret_vector}")
         print(f"[Participant {self.participant_id}] Generated participant salt: {self.participant_salt[:16]}...")
 
@@ -143,6 +145,11 @@ class DistributedParticipant(threading.Thread):
         self.public_proof, self.share_data, self.x_shares = self.v3s.share_vector(
             self.secret_vector, self.sigma_x, self.sigma_y
         )
+
+        if self.share_data is not None:
+            own_index = self.participant_id - 1
+            if 0 <= own_index < len(self.share_data):
+                self.noise_share_vector = [int(val) for val in self.share_data[own_index]['y_shares']]
 
         duration = time.time() - start_time
         print(f"[Participant {self.participant_id}] Shares created in {duration*1000:.2f} ms")
@@ -223,6 +230,7 @@ class DistributedParticipant(threading.Thread):
             salt=self.public_proof['main_salt'],
             participant_salt=self.participant_salt,
             v_shares=self.public_proof['v_shares'],
+            aggregated_v=self.public_proof['aggregated_v'],
             R=self.public_proof['R'],
             bound=self.public_proof['bound'],
             spectral_norm=self.public_proof['spectral_norm'],
@@ -387,6 +395,7 @@ class DistributedParticipant(threading.Thread):
             self.received_proofs[proof.participant_id] = {
                 'h': proof.merkle_root,
                 'v_shares': proof.v_shares,
+                'aggregated_v': proof.aggregated_v,
                 'R': proof.R,
                 'bound': proof.bound,
                 'spectral_norm': proof.spectral_norm,
@@ -743,7 +752,7 @@ class DistributedParticipant(threading.Thread):
         self.network_ops['接收验证结果 (valid_i 集合)'] = len(vectors)
 
     def generate_public_matrix_and_compute_keys(self) -> None:
-        """基于共识盐值生成公共矩阵[I|A]，并计算部分公钥和全局公钥."""
+        """基于共识盐值生成公共矩阵A，并计算部分公钥和全局公钥."""
         if self.global_secret is None:
             print(f"[Participant {self.participant_id}] ⚠️  Global secret unavailable, skip key generation")
             return
@@ -751,7 +760,7 @@ class DistributedParticipant(threading.Thread):
             print(f"[Participant {self.participant_id}] ⚠️  No consensus salt available!")
             return
 
-        print(f"[Participant {self.participant_id}] Generating public matrix [I|A] from consensus salt...")
+        print(f"[Participant {self.participant_id}] Generating public matrix A from consensus salt...")
 
         start_time = time.time()
 
@@ -768,18 +777,11 @@ class DistributedParticipant(threading.Thread):
                 value = int.from_bytes(random_bytes[byte_idx:byte_idx + 4], byteorder='big')
                 A[i, j] = value % self.v3s.prime
 
-        # 构建单位矩阵I（d×d）
-        I = np.eye(self.d, dtype=object)
-        for i in range(self.d):
-            for j in range(self.d):
-                I[i, j] = int(I[i, j])
-
-        # 扩展为 [I | A]，维度为 d×(2d)
-        self.public_matrix_A = np.hstack([I, A])
+        self.public_matrix_A = A
 
         matrix_gen_time = time.time() - start_time
-        print(f"[Participant {self.participant_id}] Generated {self.d}×{2*self.d} public matrix [I|A] ({matrix_gen_time*1000:.2f} ms)")
-        print(f"[Participant {self.participant_id}] Matrix structure: [I_{self.d}×{self.d} | A_{self.d}×{self.d}]")
+        print(f"[Participant {self.participant_id}] Generated {self.d}×{self.d} public matrix A ({matrix_gen_time*1000:.2f} ms)")
+        print(f"[Participant {self.participant_id}] Matrix structure: A_{self.d}×{self.d}")
 
         partial_key_start = time.time()
 
@@ -787,14 +789,13 @@ class DistributedParticipant(threading.Thread):
             raise ValueError("Secret vector unavailable for key generation")
 
         secret_vector = np.array(self.secret_vector, dtype=object)
-        extended_secret = np.concatenate([secret_vector, secret_vector])
 
-        # 矩阵向量乘法: b_i = [I|A] * [s_i; s_i]
+        # 公钥份额: b_i = A * s_i
         partial_public_key = np.zeros(self.d, dtype=object)
         for i in range(self.d):
             value = 0
-            for j in range(2 * self.d):
-                value = (value + int(self.public_matrix_A[i, j]) * int(extended_secret[j])) % self.v3s.prime
+            for j in range(self.d):
+                value = (value + int(self.public_matrix_A[i, j]) * int(secret_vector[j])) % self.v3s.prime
             partial_public_key[i] = int(value)
 
         # 记录部分公钥并广播
@@ -802,7 +803,7 @@ class DistributedParticipant(threading.Thread):
 
         partial_key_time = time.time() - partial_key_start
         print(
-            f"[Participant {self.participant_id}] Computed partial public key b_{self.participant_id} = [I|A] * [s_{self.participant_id}; s_{self.participant_id}] ({partial_key_time*1000:.2f} ms)"
+            f"[Participant {self.participant_id}] Computed partial public key b_{self.participant_id} = A * s_{self.participant_id} ({partial_key_time*1000:.2f} ms)"
         )
         print(
             f"[Participant {self.participant_id}] Partial public key: {[int(val) % 1000 for val in self.partial_public_key[:min(4, len(self.partial_public_key))]]}... (mod 1000)"
@@ -874,8 +875,8 @@ class DistributedParticipant(threading.Thread):
                 "全局公钥生成",
                 total_key_time,
                 {
-                    "矩阵生成 ([I|A], d×2d)": self.d * 2 * self.d,
-                    "部分公钥计算 (矩阵向量乘法)": self.d * 2 * self.d,
+                    "矩阵生成 (A, d×d)": self.d * self.d,
+                    "部分公钥计算 (A×s_i + y_i)": self.d * self.d,
                     "部分公钥广播 (每个参与者)": len(self.network.message_queues),
                     "部分公钥接收 (估计每个参与者接收)": len(all_valid_ids),
                 },

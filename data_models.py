@@ -48,6 +48,7 @@ class PublicProof:
     salt: str
     participant_salt: str  # 参与者的随机盐值 salt_i
     v_shares: List[List[int]]
+    aggregated_v: List[int]
     R: List[List[int]]
     bound: float
     spectral_norm: float

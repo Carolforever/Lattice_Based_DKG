@@ -1,7 +1,6 @@
 import base64
 import hashlib
 import json
-import random
 import time
 import threading
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -15,6 +14,8 @@ from cryptography.hazmat.primitives.asymmetric import ed25519, x25519
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.backends import default_backend
 import os
+
+from secure_rng import SecureRandom
 
 # 使用大素数以保证Shamir秘密共享的安全性
 PRIME = 2**255 - 19
@@ -54,6 +55,7 @@ class PublicProof:
     salt: str
     participant_salt: str  # 参与者的随机盐值 salt_i
     v_shares: List[List[int]]
+    aggregated_v: List[int]
     R: List[List[int]]
     bound: float
     spectral_norm: float
@@ -459,12 +461,13 @@ class NetworkSimulator:
         return vectors
 
 class V3S:
-    def __init__(self, n: int, t: int, prime: int = PRIME, slack_factor: float = 10.0):
+    def __init__(self, n: int, t: int, prime: int = PRIME, slack_factor: float = 10.0, rng: Optional[SecureRandom] = None):
         self.n = n
         self.t = t
         self.prime = prime
         self.slack_factor = slack_factor
         self.performance_stats = []
+        self.rng = rng or SecureRandom("legacy-v3s-core")
     
     def add_performance_stat(self, phase_name: str, duration: float, operations: Dict[str, int] = None):
         stat = PerformanceStats(phase_name, duration, operations or {})
@@ -655,8 +658,28 @@ class V3S:
                     matrix[i, j] = -1
         return matrix
 
+    def aggregate_v_shares(self, v_shares: List[List[int]]) -> List[int]:
+        if not v_shares:
+            return []
+
+        dimension = len(v_shares[0])
+        aggregated: List[int] = []
+
+        for idx in range(dimension):
+            shares_for_coord = [
+                Share(int(vector[idx]) % self.prime, participant_index + 1)
+                for participant_index, vector in enumerate(v_shares)
+            ]
+
+            reconstructed = self.lagrange_interpolate(shares_for_coord)
+            if reconstructed > self.prime // 2:
+                reconstructed -= self.prime
+            aggregated.append(int(reconstructed))
+
+        return aggregated
+
     def shamir_share(self, secret: int, n: int, t: int) -> List[Share]:
-        coefficients = [secret % self.prime] + [random.randint(-1, 1) for _ in range(t-1)]
+        coefficients = [secret % self.prime] + [self.rng.randbelow(self.prime) for _ in range(t-1)]
         
         shares = []
         for i in range(1, n+1):
@@ -672,7 +695,7 @@ class V3S:
         
         # 步骤1: 生成噪声向量
         start_time = time.time()
-        y_vector = [max(-15, min(15, int(random.gauss(0, sigma_y)))) for _ in range(d)]
+        y_vector = self.rng.gaussian_vector(d, 0.0, sigma_y)
         step1_time = time.time() - start_time
         
         # 步骤2: Shamir秘密共享
@@ -689,14 +712,14 @@ class V3S:
         
         # 步骤3: 构建Merkle树
         start_time = time.time()
-        salt = str(random.getrandbits(128))
+        salt = self.rng.decimal_salt(128)
         leaf_data = []
         salts = []
         
         for participant in range(self.n):
             x_participant = [x_shares[i][participant].value for i in range(d)]
             y_participant = [y_shares[i][participant].value for i in range(d)]
-            participant_salt = str(random.getrandbits(128))
+            participant_salt = self.rng.decimal_salt(128)
             salts.append(participant_salt)
             leaf = '|'.join(map(str, x_participant + y_participant)) + '|' + participant_salt
             leaf_hash = MerkleTree.hash_item(leaf)
@@ -760,6 +783,8 @@ class V3S:
                 v_i.append(int(v_elem))
             v_shares.append(v_i)
         
+        aggregated_v = self.aggregate_v_shares(v_shares)
+
         step5_time = time.time() - start_time
         self.add_performance_stat("验证向量计算", step5_time, {
             "矩阵向量乘法 (计算R·x_i,每个参与者一次)": self.n,
@@ -783,6 +808,7 @@ class V3S:
         public_proof = {
             'h': h,
             'v_shares': v_shares,
+            'aggregated_v': aggregated_v,
             'R': R.tolist(),
             'bound': bound,
             'spectral_norm': spectral_norm,
@@ -847,24 +873,24 @@ class V3S:
         
         operations['线性关系检查 (验证v_i=R·x_i+y_i是否成立)'] = len(v_calc)
         
-        # 步骤3: 验证范数
-        v_public_centered = []
+        # 步骤3: 验证聚合向量的范数
+        aggregated_v = public_proof.get('aggregated_v')
+        if aggregated_v is None:
+            aggregated_v = self.aggregate_v_shares(public_proof['v_shares'])
+
         half_prime = self.prime // 2
-        centering_ops = 0
-        
-        for val in v_public:
+        aggregated_centered: List[float] = []
+
+        for val in aggregated_v:
             int_val = int(val) % self.prime
             if int_val > half_prime:
-                centered_val = int_val - self.prime
-            else:
-                centered_val = int_val
-            v_public_centered.append(float(centered_val))
-            centering_ops += 1
-        
-        operations['中心化转换 (将模表示转为有符号数,便于计算范数)'] = centering_ops
-        
-        norm = np.linalg.norm(v_public_centered)
-        operations['范数计算 (欧几里得范数||v||₂,检查短向量性质)'] = 1
+                int_val = int_val - self.prime
+            aggregated_centered.append(float(int_val))
+
+        operations['中心化转换 (聚合验证向量)'] = len(aggregated_centered)
+
+        norm = np.linalg.norm(aggregated_centered)
+        operations['范数计算 (聚合v向量||v||₂)'] = 1
         
         duration = time.time() - start_time
         
@@ -938,11 +964,13 @@ class DistributedParticipant(threading.Thread):
         self.network = network
         self.sigma_x = sigma_x
         self.sigma_y = sigma_y
-        
-        self.v3s = V3S(n, t)
+
+        self.rng = SecureRandom(f"legacy-participant-{participant_id}")
+        self.v3s = V3S(n, t, rng=self.rng.derive_child(f"legacy-v3s-core-{participant_id}"))
         self.secret_vector = None
         self.public_proof = None
         self.share_data = None
+        self.noise_share_vector = None
         self.x_shares = None
 
         # 存储接收到的份额
@@ -961,7 +989,7 @@ class DistributedParticipant(threading.Thread):
         self.complaints_received = []  # 接收到的投诉
         
         # 盐值相关
-        self.participant_salt = str(random.getrandbits(256))  # 生成256位随机盐值 salt_i
+        self.participant_salt = self.rng.decimal_salt(256)  # 生成256位随机盐值 salt_i
         self.received_salts = {}  # 存储接收到的其他参与者的盐值 {participant_id: salt}
         self.consensus_salt = None  # 共识盐值
         
@@ -1030,7 +1058,7 @@ class DistributedParticipant(threading.Thread):
     
     def generate_secret(self):
         """生成自己的短秘密向量"""
-        self.secret_vector = [max(-3, min(3, int(random.gauss(0, self.sigma_x)))) for _ in range(self.d)]
+        self.secret_vector = self.rng.gaussian_vector(self.d, 0.0, self.sigma_x)
         print(f"[Participant {self.participant_id}] Generated secret vector: {self.secret_vector}")
         print(f"[Participant {self.participant_id}] Generated participant salt: {self.participant_salt[:16]}...")
     
@@ -1042,6 +1070,11 @@ class DistributedParticipant(threading.Thread):
         self.public_proof, self.share_data, self.x_shares = self.v3s.share_vector(
             self.secret_vector, self.sigma_x, self.sigma_y
         )
+
+        if self.share_data is not None:
+            own_index = self.participant_id - 1
+            if 0 <= own_index < len(self.share_data):
+                self.noise_share_vector = [int(val) for val in self.share_data[own_index]['y_shares']]
         
         duration = time.time() - start_time
         print(f"[Participant {self.participant_id}] Shares created in {duration*1000:.2f} ms")
@@ -1115,6 +1148,7 @@ class DistributedParticipant(threading.Thread):
             salt=self.public_proof['main_salt'],
             participant_salt=self.participant_salt,  # 广播参与者盐值 salt_i
             v_shares=self.public_proof['v_shares'],
+            aggregated_v=self.public_proof['aggregated_v'],
             R=self.public_proof['R'],
             bound=self.public_proof['bound'],
             spectral_norm=self.public_proof['spectral_norm']
@@ -1269,6 +1303,7 @@ class DistributedParticipant(threading.Thread):
             self.received_proofs[proof.participant_id] = {
                 'h': proof.merkle_root,
                 'v_shares': proof.v_shares,
+                'aggregated_v': proof.aggregated_v,
                 'R': proof.R,
                 'bound': proof.bound,
                 'spectral_norm': proof.spectral_norm,
@@ -1631,8 +1666,8 @@ class DistributedParticipant(threading.Thread):
         self.generate_public_matrix_and_compute_keys()
     
     def generate_public_matrix_and_compute_keys(self):
-        """基于共识盐值生成公共矩阵[I|A]，并计算部分公钥和全局公钥"""
-        print(f"[Participant {self.participant_id}] Generating public matrix [I|A] from consensus salt...")
+        """基于共识盐值生成公共矩阵A，并计算部分公钥和全局公钥"""
+        print(f"[Participant {self.participant_id}] Generating public matrix A from consensus salt...")
         
         if self.consensus_salt is None:
             print(f"[Participant {self.participant_id}] ⚠️  No consensus salt available!")
@@ -1659,58 +1694,48 @@ class DistributedParticipant(threading.Thread):
                 # 使用模运算将值限制在有限域内
                 A[i, j] = value % self.v3s.prime
         
-        # 构建单位矩阵I（d×d）
-        I = np.eye(self.d, dtype=object)
-        for i in range(self.d):
-            for j in range(self.d):
-                I[i, j] = int(I[i, j])
-        
-        # 扩展为 [I | A]，维度为 d×(2d)
-        self.public_matrix_A = np.hstack([I, A])
+        self.public_matrix_A = A
         
         matrix_gen_time = time.time() - start_time
-        print(f"[Participant {self.participant_id}] Generated {self.d}×{2*self.d} public matrix [I|A] ({matrix_gen_time*1000:.2f} ms)")
-        print(f"[Participant {self.participant_id}] Matrix structure: [I_{self.d}×{self.d} | A_{self.d}×{self.d}]")
+        print(f"[Participant {self.participant_id}] Generated {self.d}×{self.d} public matrix A ({matrix_gen_time*1000:.2f} ms)")
+        print(f"[Participant {self.participant_id}] Matrix structure: A_{self.d}×{self.d}")
         
-        # 计算部分公钥 b_i = [I|A] * s_i
-        # 注意：s_i 需要扩展为 2d 维向量（这里我们直接使用原始 d 维秘密重复一次）
+        # 计算部分公钥 b_i = A * s_i
         partial_key_start = time.time()
         
-        # 将秘密向量扩展为 2d 维：[s_i | s_i]
+        if self.secret_vector is None:
+            raise ValueError("Secret vector unavailable for key generation")
+
         secret_vector = np.array(self.secret_vector, dtype=object)
-        extended_secret = np.concatenate([secret_vector, secret_vector])
         
-        # 矩阵向量乘法: b_i = [I|A] * [s_i; s_i]
-        # 结果：b_i = I*s_i + A*s_i = s_i + A*s_i
         partial_public_key = np.zeros(self.d, dtype=object)
         for i in range(self.d):
             value = 0
-            for j in range(2 * self.d):
-                value = (value + int(self.public_matrix_A[i, j]) * int(extended_secret[j])) % self.v3s.prime
+            for j in range(self.d):
+                value = (value + int(self.public_matrix_A[i, j]) * int(secret_vector[j])) % self.v3s.prime
             partial_public_key[i] = int(value)
         
         self.partial_public_key = partial_public_key.tolist()
         
         partial_key_time = time.time() - partial_key_start
-        print(f"[Participant {self.participant_id}] Computed partial public key b_{self.participant_id} = [I|A] * [s_{self.participant_id}; s_{self.participant_id}] ({partial_key_time*1000:.2f} ms)")
+        print(f"[Participant {self.participant_id}] Computed partial public key b_{self.participant_id} = A * s_{self.participant_id} ({partial_key_time*1000:.2f} ms)")
         print(f"[Participant {self.participant_id}] Partial public key: {[int(val) % 1000 for val in self.partial_public_key[:min(4, len(self.partial_public_key))]]}... (mod 1000)")
         
         # 广播部分公钥
         broadcast_start = time.time()
-        from dataclasses import dataclass
-        
+
         # 创建部分公钥消息（使用现有的消息类或创建新的）
         # 这里我们使用网络直接广播
         partial_key_message = {
             'participant_id': self.participant_id,
             'partial_public_key': self.partial_public_key
         }
-        
+
         # 广播部分公钥给所有参与者
         with self.network.lock:
             for pid in self.network.message_queues.keys():
                 self.network.message_queues[pid].put(('partial_key', partial_key_message))
-        
+
         broadcast_time = time.time() - broadcast_start
         print(f"[Participant {self.participant_id}] Broadcasted partial public key ({broadcast_time*1000:.2f} ms)")
         
@@ -1771,8 +1796,8 @@ class DistributedParticipant(threading.Thread):
                 "全局公钥生成",
                 total_key_time,
                 {
-                    "矩阵生成 ([I|A], d×2d)": self.d * 2 * self.d,
-                    "部分公钥计算 (矩阵向量乘法)": self.d * 2 * self.d,
+                    "矩阵生成 (A, d×d)": self.d * self.d,
+                    "部分公钥计算 (A×s_i)": self.d * self.d,
                     "部分公钥广播 (每个参与者)": len(self.network.message_queues),
                     "部分公钥接收 (估计每个参与者接收)": len(all_valid_ids)
                 }
@@ -1995,7 +2020,7 @@ def test_distributed_v3s():
     # 验证一致性
     if global_public_keys:
         # 验证所有参与者的公共矩阵A相同
-        print(f"\n  🔐 Public Matrix [I|A] Verification:")
+        print(f"\n  🔐 Public Matrix A Verification:")
         if public_matrices:
             # 比较所有矩阵是否相同
             matrix_list = list(public_matrices.values())
@@ -2008,9 +2033,9 @@ def test_distributed_v3s():
                     break
             
             if all_same:
-                print(f"     ✓ All participants generated the SAME public matrix [I|A]!")
-                print(f"     Matrix [I|A] shape: {first_matrix.shape} (expected: {dimension}×{2*dimension})")
-                print(f"     Matrix [I|A] preview (first row, mod 1000): {[int(val) % 1000 for val in first_matrix[0][:min(8, 2*dimension)]]}")
+                print(f"     ✓ All participants generated the SAME public matrix A!")
+                print(f"     Matrix A shape: {first_matrix.shape} (expected: {dimension}×{dimension})")
+                print(f"     Matrix A preview (first row, mod 1000): {[int(val) % 1000 for val in first_matrix[0][:min(4, dimension)]]}")
             else:
                 print(f"     ✗ WARNING: Participants generated DIFFERENT public matrices!")
         
@@ -2026,43 +2051,38 @@ def test_distributed_v3s():
             for pid, key in global_public_keys.items():
                 print(f"     P{pid}: {[int(val) % 1000 for val in key[:4]]}... (mod 1000)")
         
-        # 验证数学正确性：b = [I|A] * [s_global; s_global]
-        print(f"\n  📊 Mathematical Verification: b = [I|A] * [s_global; s_global]")
-        
+        # 验证数学正确性：b = A * s_global
+        print(f"\n  📊 Mathematical Verification: b = A * s_global")
+
         if global_secrets and public_matrices:
-            # 使用第一个参与者的矩阵[I|A]和全局秘密计算期望的全局公钥
-            IA_matrix = list(public_matrices.values())[0]
-            s_global = list(global_secrets.values())[0]
-            
-            # 扩展全局秘密为 2d 维：[s_global; s_global]
-            extended_s_global = np.concatenate([s_global, s_global])
-            
-            # 计算 [I|A] * [s_global; s_global]
+            # 使用第一个参与者的矩阵A和全局秘密计算期望的全局公钥
+            A_matrix = list(public_matrices.values())[0]
+            s_global = np.array(list(global_secrets.values())[0], dtype=object)
+
             expected_global_key = np.zeros(dimension, dtype=object)
             for i in range(dimension):
                 value = 0
-                for j in range(2 * dimension):
-                    value = (value + int(IA_matrix[i, j]) * int(extended_s_global[j])) % PRIME
+                for j in range(dimension):
+                    value = (value + int(A_matrix[i, j]) * int(s_global[j])) % PRIME
                 expected_global_key[i] = int(value)
-            
-            expected_global_key_list = expected_global_key.tolist();
-            
-            print(f"  Expected b = [I|A] * [s_global; s_global]: {[int(val) % 1000 for val in expected_global_key_list[:4]]}... (mod 1000)")
-            print(f"  Note: b = I*s_global + A*s_global = s_global + A*s_global (LWE form)")
-            
+
+            expected_global_key_list = expected_global_key.tolist()
+
+            print(f"  Expected b = A * s_global: {[int(val) % 1000 for val in expected_global_key_list[:4]]}... (mod 1000)")
+
             # 比较计算的全局公钥与期望值
             if unique_keys:
                 computed_key = list(unique_keys[0])
                 match = all(int(computed_key[i]) % PRIME == int(expected_global_key_list[i]) % PRIME for i in range(dimension))
-                
+
                 if match:
-                    print(f"  ✓ Global public key MATCHES [I|A] * [s_global; s_global]!")
+                    print(f"  ✓ Global public key MATCHES A * s_global!")
                 else:
-                    print(f"  ✗ Global public key DOES NOT match [I|A] * [s_global; s_global]!")
+                    print(f"  ✗ Global public key DOES NOT match A * s_global!")
                     print(f"  Difference (first 4): {[int(computed_key[i]) - int(expected_global_key_list[i]) for i in range(min(4, dimension))]}")
-        
-        # 验证：b = sum(b_i) = sum([I|A] * [s_i; s_i])
-        print(f"\n  📊 Verification: b = sum(b_i) = sum([I|A] * [s_i; s_i])")
+
+        # 验证：b = sum(b_i) = sum(A * s_i)
+        print(f"\n  📊 Verification: b = sum(b_i) = sum(A * s_i)")
         
         if partial_public_keys and len(partial_public_keys) >= threshold:
             # 计算所有部分公钥的和
@@ -2072,7 +2092,7 @@ def test_distributed_v3s():
                 for i in range(dimension):
                     computed_sum[i] = (int(computed_sum[i]) + int(partial_key[i])) % PRIME
             
-            computed_sum_list = computed_sum.tolist();
+            computed_sum_list = computed_sum.tolist()
             
             print(f"  Computed sum(b_i): {[int(val) % 1000 for val in computed_sum_list[:4]]}... (mod 1000)")
             
@@ -2147,8 +2167,8 @@ def test_distributed_v3s():
         public_key_times = [p.public_key_generation_time for p in participants]
         max_pub_key_time = max(public_key_times) if public_key_times else 0
         combined_pub_ops = {
-            "矩阵生成 ([I|A], d×2d, 所有参与者)": num_participants * dimension * 2 * dimension,
-            "部分公钥计算 (矩阵向量乘法, 所有参与者)": num_participants * dimension * 2 * dimension,
+            "矩阵生成 (A, d×d, 所有参与者)": num_participants * dimension * dimension,
+            "部分公钥计算 (A×s_i, 所有参与者)": num_participants * dimension * dimension,
             "部分公钥广播 (估计)": num_participants,
             "部分公钥接收 (估计)": num_participants * num_participants
         }

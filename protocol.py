@@ -75,8 +75,8 @@ def _aggregate_performance(participants: List[DistributedParticipant], dimension
     public_key_times = [p.public_key_generation_time for p in participants]
     max_pub_key_time = max(public_key_times) if public_key_times else 0
     combined_pub_ops = {
-        "矩阵生成 ([I|A], d×2d, 所有参与者)": len(participants) * dimension * 2 * dimension,
-        "部分公钥计算 (矩阵向量乘法, 所有参与者)": len(participants) * dimension * 2 * dimension,
+        "矩阵生成 (A, d×d, 所有参与者)": len(participants) * dimension * dimension,
+        "部分公钥计算 (A×s_i, 所有参与者)": len(participants) * dimension * dimension,
         "部分公钥广播 (估计)": len(participants),
         "部分公钥接收 (估计)": len(participants) * len(participants),
     }
@@ -316,17 +316,17 @@ def test_distributed_v3s() -> None:
             print(f"  Participant {participant.participant_id}: ✗ Failed to generate global public key")
 
     if global_public_keys:
-        print(f"\n  🔐 Public Matrix [I|A] Verification:")
+        print(f"\n  🔐 Public Matrix A Verification:")
         if public_matrices:
             matrix_list = list(public_matrices.values())
             all_same = all(np.array_equal(matrix_list[0], matrix) for matrix in matrix_list[1:])
 
             if all_same:
                 first_matrix = matrix_list[0]
-                print(f"     ✓ All participants generated the SAME public matrix [I|A]!")
-                print(f"     Matrix [I|A] shape: {first_matrix.shape} (expected: {dimension}×{2*dimension})")
+                print(f"     ✓ All participants generated the SAME public matrix A!")
+                print(f"     Matrix A shape: {first_matrix.shape} (expected: {dimension}×{dimension})")
                 print(
-                    f"     Matrix [I|A] preview (first row, mod 1000): {[int(val) % 1000 for val in first_matrix[0][:min(8, 2*dimension)]]}"
+                    f"     Matrix A preview (first row, mod 1000): {[int(val) % 1000 for val in first_matrix[0][:min(4, dimension)]]}"
                 )
             else:
                 # 输出不一致提示，后续可打印矩阵差异（如有需要）
@@ -343,27 +343,24 @@ def test_distributed_v3s() -> None:
             for pid, key in global_public_keys.items():
                 print(f"     P{pid}: {[int(val) % 1000 for val in key[:4]]}... (mod 1000)")
 
-        print(f"\n  📊 Mathematical Verification: b = [I|A] * [s_global; s_global]")
+        print(f"\n  📊 Mathematical Verification: b = A * s_global")
 
         if global_secrets and public_matrices:
-            IA_matrix = list(public_matrices.values())[0]
-            s_global = list(global_secrets.values())[0]
-
-            extended_s_global = np.concatenate([s_global, s_global])
+            A_matrix = list(public_matrices.values())[0]
+            s_global = np.array(list(global_secrets.values())[0], dtype=object)
 
             expected_global_key = np.zeros(dimension, dtype=object)
             for i in range(dimension):
                 value = 0
-                for j in range(2 * dimension):
-                    value = (value + int(IA_matrix[i, j]) * int(extended_s_global[j])) % PRIME
+                for j in range(dimension):
+                    value = (value + int(A_matrix[i, j]) * int(s_global[j])) % PRIME
                 expected_global_key[i] = int(value)
 
             expected_global_key_list = expected_global_key.tolist()
 
             print(
-                f"  Expected b = [I|A] * [s_global; s_global]: {[int(val) % 1000 for val in expected_global_key_list[:4]]}... (mod 1000)"
+                f"  Expected b = A * s_global: {[int(val) % 1000 for val in expected_global_key_list[:4]]}... (mod 1000)"
             )
-            print(f"  Note: b = I*s_global + A*s_global = s_global + A*s_global (LWE form)")
 
             if unique_keys:
                 computed_key = list(unique_keys[0])
@@ -373,15 +370,15 @@ def test_distributed_v3s() -> None:
                 )
 
                 if match:
-                    print(f"  ✓ Global public key MATCHES [I|A] * [s_global; s_global]!")
+                    print(f"  ✓ Global public key MATCHES A * s_global!")
                 else:
                     # 打印前若干维差值，便于定位不一致来源
-                    print(f"  ✗ Global public key DOES NOT match [I|A] * [s_global; s_global]!")
+                    print(f"  ✗ Global public key DOES NOT match A * s_global!")
                     print(
                         f"  Difference (first 4): {[int(computed_key[idx]) - int(expected_global_key_list[idx]) for idx in range(min(4, dimension))]}"
                     )
 
-        print(f"\n  📊 Verification: b = sum(b_i) = sum([I|A] * [s_i; s_i])")
+        print(f"\n  📊 Verification: b = sum(b_i) = sum(A * s_i)")
 
         if partial_public_keys and len(partial_public_keys) >= threshold:
             computed_sum = np.zeros(dimension, dtype=object)
