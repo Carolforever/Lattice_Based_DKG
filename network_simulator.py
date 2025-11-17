@@ -23,6 +23,20 @@ class NetworkSimulator:
         self.lock = threading.Lock()
         self.signing_public_keys: Dict[int, bytes] = {}
         self.kem_public_keys: Dict[int, bytes] = {}
+        self.network_delay: float = 0.015  # 15 ms simulated latency per message
+
+    def _enqueue_message(self, participant_id: int, msg_type: str, payload) -> None:
+        queue = None
+        with self.lock:
+            queue = self.message_queues.get(participant_id)
+        if queue is None:
+            return
+        time.sleep(self.network_delay)
+        queue.put((msg_type, payload))
+
+    def _all_participant_ids(self) -> List[int]:
+        with self.lock:
+            return list(self.message_queues.keys())
 
     def register_participant(
         self,
@@ -56,33 +70,27 @@ class NetworkSimulator:
 
     def send_encrypted_share(self, package: EncryptedSharePackage) -> None:
         """发送加密份额 / Send an encrypted share to its receiver."""
-        with self.lock:
-            if package.receiver_id in self.message_queues:
-                self.message_queues[package.receiver_id].put(('share', package))
+        self._enqueue_message(package.receiver_id, 'share', package)
 
     def broadcast_proof(self, proof: PublicProof) -> None:
         """广播公开证明 / Broadcast a public proof to all participants."""
-        with self.lock:
-            for participant_id in self.message_queues.keys():
-                self.message_queues[participant_id].put(('proof', proof))
+        for participant_id in self._all_participant_ids():
+            self._enqueue_message(participant_id, 'proof', proof)
 
     def broadcast_complaint(self, complaint: Complaint) -> None:
         """广播投诉消息 / Broadcast a complaint message."""
-        with self.lock:
-            for participant_id in self.message_queues.keys():
-                self.message_queues[participant_id].put(('complaint', complaint))
+        for participant_id in self._all_participant_ids():
+            self._enqueue_message(participant_id, 'complaint', complaint)
 
     def broadcast_aggregated_share(self, agg_share: AggregatedShare) -> None:
         """广播聚合份额 / Broadcast aggregated shares during reconstruction."""
-        with self.lock:
-            for participant_id in self.message_queues.keys():
-                self.message_queues[participant_id].put(('aggregated', agg_share))
+        for participant_id in self._all_participant_ids():
+            self._enqueue_message(participant_id, 'aggregated', agg_share)
 
     def broadcast_validation_vector(self, validation: ValidationVector) -> None:
         """广播验证结果 / Broadcast the locally accepted sender list."""
-        with self.lock:
-            for participant_id in self.message_queues.keys():
-                self.message_queues[participant_id].put(('validation', validation))
+        for participant_id in self._all_participant_ids():
+            self._enqueue_message(participant_id, 'validation', validation)
 
     def receive_encrypted_shares(self, participant_id: int, timeout: float = 5.0) -> List[EncryptedSharePackage]:
         """接收加密份额 / Receive encrypted share packages."""

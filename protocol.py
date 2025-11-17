@@ -68,6 +68,7 @@ def _aggregate_performance(participants: List[DistributedParticipant], dimension
             "拉格朗日插值 (使用t个聚合份额重构全局秘密)": len(participants) * dimension,
             "模逆元计算 (拉格朗日插值中的模逆运算)": len(participants) * dimension * threshold * (threshold - 1),
             "模乘法 (拉格朗日基函数计算)": len(participants) * dimension * threshold * threshold * 2,
+            "中心化转换 (重构结果转回有符号表示)": len(participants) * dimension,
         },
     )
 
@@ -75,10 +76,12 @@ def _aggregate_performance(participants: List[DistributedParticipant], dimension
     public_key_times = [p.public_key_generation_time for p in participants]
     max_pub_key_time = max(public_key_times) if public_key_times else 0
     combined_pub_ops = {
+        "SHAKE-256摘要 (生成矩阵伪随机字节)": len(participants) * dimension * dimension * 4,
         "矩阵生成 (A, d×d, 所有参与者)": len(participants) * dimension * dimension,
         "部分公钥计算 (A×s_i, 所有参与者)": len(participants) * dimension * dimension,
         "部分公钥广播 (估计)": len(participants),
         "部分公钥接收 (估计)": len(participants) * len(participants),
+        "全局公钥聚合 (求和所有部分公钥)": len(participants) * len(participants) * dimension,
     }
     aggregated_v3s.add_performance_stat("全局公钥生成", max_pub_key_time, combined_pub_ops)
 

@@ -289,6 +289,20 @@ class NetworkSimulator:
         self.lock = threading.Lock()
         self.signing_public_keys: Dict[int, bytes] = {}
         self.kem_public_keys: Dict[int, bytes] = {}
+        self.network_delay: float = 0.015  # 每条消息的模拟延时 (15ms)
+
+    def _enqueue_message(self, participant_id: int, msg_type: str, payload) -> None:
+        queue = None
+        with self.lock:
+            queue = self.message_queues.get(participant_id)
+        if queue is None:
+            return
+        time.sleep(self.network_delay)
+        queue.put((msg_type, payload))
+
+    def _all_participant_ids(self) -> List[int]:
+        with self.lock:
+            return list(self.message_queues.keys())
     
     def register_participant(
         self,
@@ -314,33 +328,27 @@ class NetworkSimulator:
     
     def send_encrypted_share(self, package: EncryptedSharePackage):
         """发送加密份额"""
-        with self.lock:
-            if package.receiver_id in self.message_queues:
-                self.message_queues[package.receiver_id].put(('share', package))
+        self._enqueue_message(package.receiver_id, 'share', package)
     
     def broadcast_proof(self, proof: PublicProof):
         """广播公开证明"""
-        with self.lock:
-            for participant_id in self.message_queues.keys():
-                self.message_queues[participant_id].put(('proof', proof))
+        for participant_id in self._all_participant_ids():
+            self._enqueue_message(participant_id, 'proof', proof)
     
     def broadcast_complaint(self, complaint: Complaint):
         """广播投诉消息"""
-        with self.lock:
-            for participant_id in self.message_queues.keys():
-                self.message_queues[participant_id].put(('complaint', complaint))
+        for participant_id in self._all_participant_ids():
+            self._enqueue_message(participant_id, 'complaint', complaint)
     
     def broadcast_aggregated_share(self, agg_share: 'AggregatedShare'):
         """广播聚合份额"""
-        with self.lock:
-            for participant_id in self.message_queues.keys():
-                self.message_queues[participant_id].put(('aggregated', agg_share))
+        for participant_id in self._all_participant_ids():
+            self._enqueue_message(participant_id, 'aggregated', agg_share)
 
     def broadcast_validation_vector(self, validation: ValidationVector) -> None:
         """广播本地验证结果"""
-        with self.lock:
-            for participant_id in self.message_queues.keys():
-                self.message_queues[participant_id].put(('validation', validation))
+        for participant_id in self._all_participant_ids():
+            self._enqueue_message(participant_id, 'validation', validation)
     
     def receive_encrypted_shares(self, participant_id: int, timeout: float = 5.0) -> List[EncryptedSharePackage]:
         """接收加密份额"""
@@ -486,7 +494,7 @@ class V3S:
             percentage = (stat.duration / total_time * 100) if total_time > 0 else 0
             
             print(f"┌─ Phase {idx}: {stat.phase_name}")
-            print(f"│  ⏱  Duration:    {stat.duration*1000:.4f} ms  ({percentage:.1f}% of total)")
+            print(f"│  ⏱  Duration:    {stat.duration*1000:.4f} ms  ({percentage:.4f}% of total)")
             
             if stat.operations:
                 print(f"│  📊 操作次数:")
@@ -704,6 +712,7 @@ class V3S:
         y_shares = [self.shamir_share(y_vector[i], self.n, self.t) for i in range(d)]
         step2_time = time.time() - start_time
         self.add_performance_stat("Shamir秘密共享", step2_time, {
+            "高斯噪声采样 (生成y向量)": d,
             "多项式构造 (为x和y的每个分量创建t-1次多项式)": 2 * d,
             "份额生成 (对每个多项式生成n个份额点)": 2 * d * self.n,
             "模幂运算 (计算i^power mod p,用于多项式求值)": 2 * d * self.n * self.t,
@@ -784,14 +793,27 @@ class V3S:
             v_shares.append(v_i)
         
         aggregated_v = self.aggregate_v_shares(v_shares)
+        lagrange_interps = len(aggregated_v)
+        interpolation_participants = len(v_shares)
+        lagrange_mod_inverses = lagrange_interps * interpolation_participants
+        lagrange_mod_mults = 0
+        if interpolation_participants > 0:
+            lagrange_mod_mults = lagrange_interps * (2 * interpolation_participants * interpolation_participants)
 
         step5_time = time.time() - start_time
-        self.add_performance_stat("验证向量计算", step5_time, {
+        operations = {
             "矩阵向量乘法 (计算R·x_i,每个参与者一次)": self.n,
             "标量乘法 (矩阵元素×向量元素,共n×d×d次)": matrix_mults,
             "模运算 (加法+取模,保持在有限域GF(p)内)": modular_ops,
-            "中心化转换 (将[0,p)映射到[-p/2,p/2],便于范数计算)": self.n * d
-        })
+            "中心化转换 (将[0,p)映射到[-p/2,p/2],便于范数计算)": self.n * d,
+        }
+
+        if lagrange_interps > 0:
+            operations["拉格朗日插值 (聚合验证向量,每个维度一次)"] = lagrange_interps
+            operations["模逆元计算 (插值中的模逆运算)"] = lagrange_mod_inverses
+            operations["模乘法 (插值基函数与加权累计)"] = lagrange_mod_mults
+
+        self.add_performance_stat("验证向量计算", step5_time, operations)
         
         # 准备证明数据
         share_data = []
@@ -2160,6 +2182,7 @@ def test_distributed_v3s():
                 "拉格朗日插值 (使用t个聚合份额重构全局秘密)": num_participants * dimension,
                 "模逆元计算 (拉格朗日插值中的模逆运算)": num_participants * dimension * threshold * (threshold - 1),
                 "模乘法 (拉格朗日基函数计算)": num_participants * dimension * threshold * threshold * 2,
+                "中心化转换 (重构结果转回有符号表示)": num_participants * dimension,
             }
         )
         
@@ -2167,10 +2190,12 @@ def test_distributed_v3s():
         public_key_times = [p.public_key_generation_time for p in participants]
         max_pub_key_time = max(public_key_times) if public_key_times else 0
         combined_pub_ops = {
+            "SHAKE-256摘要 (生成矩阵伪随机字节)": num_participants * dimension * dimension * 4,
             "矩阵生成 (A, d×d, 所有参与者)": num_participants * dimension * dimension,
             "部分公钥计算 (A×s_i, 所有参与者)": num_participants * dimension * dimension,
             "部分公钥广播 (估计)": num_participants,
-            "部分公钥接收 (估计)": num_participants * num_participants
+            "部分公钥接收 (估计)": num_participants * num_participants,
+            "全局公钥聚合 (求和所有部分公钥)": num_participants * num_participants * dimension,
         }
         aggregated_v3s.add_performance_stat("全局公钥生成", max_pub_key_time, combined_pub_ops)
         

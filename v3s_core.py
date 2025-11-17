@@ -39,7 +39,7 @@ class V3S:
             percentage = (stat.duration / total_time * 100) if total_time > 0 else 0
 
             print(f"┌─ Phase {idx}: {stat.phase_name}")
-            print(f"│  ⏱  Duration:    {stat.duration*1000:.4f} ms  ({percentage:.1f}% of total)")
+            print(f"│  ⏱  Duration:    {stat.duration*1000:.4f} ms  ({percentage:.4f}% of total)")
 
             if stat.operations:
                 print("│  📊 操作次数:")
@@ -253,6 +253,7 @@ class V3S:
         y_shares = [self.shamir_share(y_vector[i], self.n, self.t) for i in range(d)]
         step2_time = time.time() - start_time
         self.add_performance_stat("Shamir秘密共享", step2_time, {
+            "高斯噪声采样 (生成y向量)": d,
             "多项式构造 (为x和y的每个分量创建t-1次多项式)": 2 * d,
             "份额生成 (对每个多项式生成n个份额点)": 2 * d * self.n,
             "模幂运算 (计算i^power mod p,用于多项式求值)": 2 * d * self.n * self.t,
@@ -331,14 +332,27 @@ class V3S:
             v_shares.append(v_i)
 
         aggregated_v = self.aggregate_v_shares(v_shares)
+        lagrange_interps = len(aggregated_v)
+        interpolation_participants = len(v_shares)
+        lagrange_mod_inverses = lagrange_interps * interpolation_participants
+        lagrange_mod_mults = 0
+        if interpolation_participants > 0:
+            lagrange_mod_mults = lagrange_interps * (2 * interpolation_participants * interpolation_participants)
 
         step5_time = time.time() - start_time
-        self.add_performance_stat("验证向量计算", step5_time, {
+        operations = {
             "矩阵向量乘法 (计算R·x_i,每个参与者一次)": self.n,
             "标量乘法 (矩阵元素×向量元素,共n×d×d次)": matrix_mults,
             "模运算 (加法+取模,保持在有限域GF(p)内)": modular_ops,
-            "中心化转换 (将[0,p)映射到[-p/2,p/2],便于范数计算)": self.n * d
-        })
+            "中心化转换 (将[0,p)映射到[-p/2,p/2],便于范数计算)": self.n * d,
+        }
+
+        if lagrange_interps > 0:
+            operations["拉格朗日插值 (聚合验证向量,每个维度一次)"] = lagrange_interps
+            operations["模逆元计算 (插值中的模逆运算)"] = lagrange_mod_inverses
+            operations["模乘法 (插值基函数与加权累计)"] = lagrange_mod_mults
+
+        self.add_performance_stat("验证向量计算", step5_time, operations)
 
         # 准备证明数据
         share_data = []
