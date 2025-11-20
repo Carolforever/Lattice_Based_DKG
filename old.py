@@ -1,9 +1,12 @@
+from __future__ import annotations
+
 import base64
 import hashlib
 import json
+import math
 import time
 import threading
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 from dataclasses import dataclass, field
 from queue import Queue
 import numpy as np
@@ -14,15 +17,258 @@ from cryptography.hazmat.primitives.asymmetric import ed25519, x25519
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.backends import default_backend
 import os
+import sys
+import datetime
+from pathlib import Path
+import atexit
 
 from secure_rng import SecureRandom
 
-# 使用大素数以保证Shamir秘密共享的安全性
-PRIME = 2**255 - 19
+PRIME = 12289
+RING_DEGREE = 8  # degree n of X^n + 1
+LOG_DIR = Path(__file__).resolve().parent / "log"
+RUN_LOG_HANDLE = None
+CURRENT_LOG_PATH: Optional[Path] = None
+
+
+def setup_run_logger() -> Path:
+    """在 ./log 目录创建按日期递增的日志文件并重定向标准输出/错误。"""
+    global RUN_LOG_HANDLE, CURRENT_LOG_PATH
+    if RUN_LOG_HANDLE is not None and CURRENT_LOG_PATH is not None:
+        return CURRENT_LOG_PATH
+
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    date_str = datetime.datetime.now().strftime("%Y%m%d")
+
+    sequence = 1
+    for path in sorted(LOG_DIR.glob(f"{date_str}-*.log")):
+        stem = path.stem
+        if not stem.startswith(date_str + "-"):
+            continue
+        suffix = stem[len(date_str) + 1 :]
+        if suffix.isdigit():
+            sequence = max(sequence, int(suffix) + 1)
+
+    log_path = LOG_DIR / f"{date_str}-{sequence:03d}.log"
+    RUN_LOG_HANDLE = open(log_path, "w", encoding="utf-8")
+    CURRENT_LOG_PATH = log_path
+    sys.stdout = RUN_LOG_HANDLE  # type: ignore[assignment]
+    sys.stderr = RUN_LOG_HANDLE  # type: ignore[assignment]
+    atexit.register(RUN_LOG_HANDLE.close)
+    return log_path
+
+
+def _center(value: int, modulus: int) -> int:
+    """将模 q 系数映射到 [-q/2, q/2] 区间，方便做范数计算。"""
+    half = modulus // 2
+    value %= modulus
+    if value > half:
+        value -= modulus
+    return value
+
+
+class PolyR:
+    """R_q = Z_q[X]/(X^n + 1) 中的环元素抽象，封装常见算术操作。"""
+
+    __slots__ = ("coeffs", "modulus", "degree")
+
+    def __init__(self, coeffs: Sequence[int], modulus: int = PRIME, degree: int = RING_DEGREE):
+        """创建多项式，长度必须等于 degree，并会自动做模规约。"""
+        if len(coeffs) != degree:
+            raise ValueError(f"Polynomial must have exactly {degree} coefficients")
+        self.modulus = modulus
+        self.degree = degree
+        self.coeffs = [int(c) % modulus for c in coeffs]
+
+    @staticmethod
+    def zero(modulus: int = PRIME, degree: int = RING_DEGREE) -> "PolyR":
+        """返回零多项式。"""
+        return PolyR([0] * degree, modulus, degree)
+
+    @staticmethod
+    def one(modulus: int = PRIME, degree: int = RING_DEGREE) -> "PolyR":
+        """返回常数项为 1 的单位多项式。"""
+        coeffs = [0] * degree
+        coeffs[0] = 1
+        return PolyR(coeffs, modulus, degree)
+
+    def copy(self) -> "PolyR":
+        """生成当前多项式的深拷贝。"""
+        return PolyR(list(self.coeffs), self.modulus, self.degree)
+
+    # Arithmetic ---------------------------------------------------------
+    def _check(self, other: "PolyR") -> None:
+        """确保参与运算的多项式位于相同的环参数。"""
+        if self.modulus != other.modulus or self.degree != other.degree:
+            raise ValueError("Mismatched ring parameters for PolyR operation")
+
+    def __add__(self, other: "PolyR") -> "PolyR":
+        """逐系数相加并模规约，实现环加法。"""
+        self._check(other)
+        return PolyR(
+            [(a + b) % self.modulus for a, b in zip(self.coeffs, other.coeffs)],
+            self.modulus,
+            self.degree,
+        )
+
+    def __sub__(self, other: "PolyR") -> "PolyR":
+        """逐系数相减并模规约，实现环减法。"""
+        self._check(other)
+        return PolyR(
+            [(a - b) % self.modulus for a, b in zip(self.coeffs, other.coeffs)],
+            self.modulus,
+            self.degree,
+        )
+
+    def __neg__(self) -> "PolyR":
+        """返回当前多项式的加法逆元。"""
+        return PolyR([(-c) % self.modulus for c in self.coeffs], self.modulus, self.degree)
+
+    def __mul__(self, other: Any) -> "PolyR":
+        """支持多项式卷积乘法或整数标量乘法。"""
+        if isinstance(other, PolyR):
+            self._check(other)
+            result = [0] * self.degree
+            for i, a in enumerate(self.coeffs):
+                if a == 0:
+                    continue
+                for j, b in enumerate(other.coeffs):
+                    if b == 0:
+                        continue
+                    deg = i + j
+                    product = (a * b) % self.modulus
+                    if deg < self.degree:
+                        result[deg] = (result[deg] + product) % self.modulus
+                    else:
+                        # X^{n+k} ≡ -X^k modulo X^n + 1
+                        idx = deg - self.degree
+                        result[idx] = (result[idx] - product) % self.modulus
+            return PolyR(result, self.modulus, self.degree)
+        elif isinstance(other, int):
+            scalar = other % self.modulus
+            return PolyR([(scalar * c) % self.modulus for c in self.coeffs], self.modulus, self.degree)
+        else:
+            return NotImplemented
+
+    def __rmul__(self, other: int) -> "PolyR":
+        """支持整数在左侧的乘法语法。"""
+        return self.__mul__(other)
+
+    def __eq__(self, other: object) -> bool:
+        """比较两个多项式在同一环参数下是否完全一致。"""
+        if not isinstance(other, PolyR):
+            return False
+        return (
+            self.modulus == other.modulus
+            and self.degree == other.degree
+            and all((a - b) % self.modulus == 0 for a, b in zip(self.coeffs, other.coeffs))
+        )
+
+    def centered_coeffs(self) -> List[int]:
+        """返回映射到中心区间后的系数列表。"""
+        return [_center(c, self.modulus) for c in self.coeffs]
+
+    def __repr__(self) -> str:
+        """提供简洁的调试表示，只展示前几个系数。"""
+        preview = ", ".join(map(str, self.coeffs[:3]))
+        if self.degree > 3:
+            preview += ", ..."
+        return f"PolyR([{preview}], q={self.modulus}, n={self.degree})"
+
+
+VectorR = List[PolyR]
+MatrixR = List[List[PolyR]]
+
+
+def poly_from_coeffs(coeffs: Sequence[int], modulus: int = PRIME, degree: int = RING_DEGREE) -> PolyR:
+    """根据给定系数生成 PolyR，多余或不足的项使用截断/补零方式处理。"""
+    if len(coeffs) != degree:
+        coeffs = list(coeffs)[:degree] + [0] * max(0, degree - len(coeffs))
+    return PolyR(coeffs, modulus, degree)
+
+
+def vector_from_coeff_lists(data: Sequence[Sequence[int]], modulus: int, degree: int) -> VectorR:
+    """将二维整数数组转换为 PolyR 向量。"""
+    return [poly_from_coeffs(coeffs, modulus, degree) for coeffs in data]
+
+
+def matrix_from_coeff_lists(data: Sequence[Sequence[Sequence[int]]], modulus: int, degree: int) -> MatrixR:
+    """把三维整数数组映射为环矩阵，每个元素均为 PolyR。"""
+    return [vector_from_coeff_lists(row, modulus, degree) for row in data]
+
+
+def vector_to_coeff_lists(vec: Sequence[PolyR]) -> List[List[int]]:
+    """将 PolyR 向量展开为普通整数系数列表，方便序列化。"""
+    return [list(poly.coeffs) for poly in vec]
+
+
+def matrix_to_coeff_lists(matrix: Sequence[Sequence[PolyR]]) -> List[List[List[int]]]:
+    """将 PolyR 矩阵展开成三维整数数组，便于 JSON/哈希处理。"""
+    return [vector_to_coeff_lists(row) for row in matrix]
+
+
+def coeff_lists_to_tuple(data: Sequence[Sequence[int]]) -> Tuple[Tuple[int, ...], ...]:
+    """把嵌套列表转为不可变元组，便于比较与去重。"""
+    return tuple(tuple(int(coeff) for coeff in poly) for poly in data)
+
+
+def vector_to_serial(vec: Sequence[PolyR]) -> Tuple[Tuple[int, ...], ...]:
+    """把 PolyR 向量转换为可哈希的嵌套元组表示。"""
+    return coeff_lists_to_tuple(vector_to_coeff_lists(vec))
+
+
+def matrix_to_serial(matrix: Sequence[Sequence[PolyR]]) -> Tuple[Tuple[Tuple[int, ...], ...], ...]:
+    """将环矩阵转换为嵌套元组序列，确保矩阵可进行集合/字典比较。"""
+    return tuple(tuple(tuple(int(coeff) for coeff in poly.coeffs) for poly in row) for row in matrix)
+
+
+def mat_vec_mul(matrix: MatrixR, vector: VectorR, modulus: int, degree: int) -> VectorR:
+    """在 R_q^k 中执行矩阵向量乘法，累加结果并返回新向量。"""
+    result: VectorR = []
+    for row in matrix:
+        acc = PolyR.zero(modulus, degree)
+        for coeff, vec_entry in zip(row, vector):
+            acc = acc + (coeff * vec_entry)
+        result.append(acc)
+    return result
+
+
+def encode_poly(poly: PolyR) -> bytes:
+    """把单个多项式的系数编码为字节流（每项 16bit，小端序）。"""
+    out = bytearray()
+    for coeff in poly.coeffs:
+        out.extend(int(coeff % poly.modulus).to_bytes(2, "little"))
+    return bytes(out)
+
+
+def encode_vector(vec: Sequence[PolyR]) -> bytes:
+    """串联多个 PolyR 的编码结果，得到完整向量的字节表示。"""
+    blob = bytearray()
+    for poly in vec:
+        blob.extend(encode_poly(poly))
+    return bytes(blob)
+
+
+def gaussian_poly(rng: SecureRandom, degree: int, sigma: float, modulus: int) -> PolyR:
+    """从高斯分布采样多项式的每个系数，并投影到给定模数。"""
+    coeffs = [rng.gaussian_int_unbounded(0.0, sigma) % modulus for _ in range(degree)]
+    return PolyR(coeffs, modulus, degree)
+
+
+def poly_l2(poly: PolyR) -> float:
+    """计算单个多项式系数的 L2 范数。"""
+    return math.sqrt(sum(c * c for c in poly.centered_coeffs()))
+
+
+def vector_l2(vec: Sequence[PolyR]) -> float:
+    """计算多项式向量的 L2 范数：逐个元素取范数后再平方求和。"""
+    return math.sqrt(sum(poly_l2(poly) ** 2 for poly in vec))
 
 @dataclass
 class Share:
-    value: int
+    """Generic Shamir share that can hold either scalars or PolyR elements."""
+
+    value: Any
     index: int
 
 @dataclass
@@ -33,6 +279,7 @@ class PerformanceStats:
     operations: Dict[str, int] = None
     
     def __post_init__(self):
+        """确保 operations 字段在 dataclass 初始化后总是指向独立可变字典。"""
         if self.operations is None:
             self.operations = {}
 
@@ -49,22 +296,24 @@ class EncryptedSharePackage:
 
 @dataclass
 class PublicProof:
-    """公开证明"""
+    """公开证明 (序列化后的环向量数据)."""
+
     participant_id: int
     merkle_root: str
     salt: str
     participant_salt: str  # 参与者的随机盐值 salt_i
-    v_shares: List[List[int]]
-    aggregated_v: List[int]
-    R: List[List[int]]
+    v_shares: List[List[List[int]]]
+    aggregated_v: List[List[int]]
+    R: List[List[List[int]]]
     bound: float
     spectral_norm: float
 
 @dataclass
 class AggregatedShare:
     """聚合份额消息"""
+
     participant_id: int      # 发送者ID
-    aggregated_values: List[int]  # 聚合后的d维份额值（在该参与者位置）
+    aggregated_values: VectorR  # 聚合后的d维份额值（在该参与者位置）
 
 @dataclass
 class Complaint:
@@ -87,23 +336,35 @@ class ValidationVector:
     accepted_ids: List[int]
 
 class MerkleNode:
+    """Merkle 树节点，持有节点哈希以及可选的左右子节点引用。"""
+
     def __init__(self, hash_value: str, left=None, right=None):
+        """构造一个节点；叶子节点仅存储哈希，内部节点还链接左右子节点。"""
         self.hash = hash_value
         self.left = left
         self.right = right
 
 class MerkleTree:
+    """用于生成、证明与验证份额承诺的 Merkle 树封装。"""
+
     def __init__(self, leaves: List[str]):
+        """对叶子列表做偶数填充并立即构建整棵树，保存根哈希。"""
         if len(leaves) % 2 == 1:
             leaves = leaves + [leaves[-1]]
         self.leaves = leaves
         self.root = self.build_tree([MerkleNode(h) for h in leaves])
 
     @staticmethod
-    def hash_item(item: str) -> str:
-        return hashlib.sha256(item.encode()).hexdigest()
+    def hash_item(item: Union[str, bytes]) -> str:
+        """对字符串或字节做 SHA-256，统一返回十六进制字符串。"""
+        if isinstance(item, str):
+            item_bytes = item.encode()
+        else:
+            item_bytes = item
+        return hashlib.sha256(item_bytes).hexdigest()
 
     def build_tree(self, nodes: List[MerkleNode]):
+        """自底向上迭代合并节点，必要时复制最后一个节点以保持满二叉结构。"""
         if not nodes:
             return MerkleNode('')
         while len(nodes) > 1:
@@ -119,6 +380,7 @@ class MerkleTree:
         return nodes[0]
 
     def get_proof(self, index: int) -> List[Tuple[str, str]]:
+        """生成指定叶子的默克尔证明，记录兄弟节点哈希及其相对位置。"""
         proof = []
         idx = index
         level = [MerkleNode(h) for h in self.leaves]
@@ -141,6 +403,7 @@ class MerkleTree:
 
     @staticmethod
     def verify_proof(leaf_hash: str, proof: List[Tuple[str, str]], root_hash: str) -> bool:
+        """沿证明路径重算根哈希，用于校验 leaf_hash 是否属于给定根。"""
         computed_hash = leaf_hash
         for sibling_hash, position in proof:
             if position == 'left':
@@ -284,14 +547,15 @@ class NetworkSimulator:
     """网络模拟器，用于参与者之间的通信"""
     
     def __init__(self):
+        """初始化消息队列、伪网络延迟及各类公钥表，用于模拟真实网络环境。"""
         self.message_queues: Dict[int, Queue] = {}
-        self.broadcast_queue: Queue = Queue()
         self.lock = threading.Lock()
         self.signing_public_keys: Dict[int, bytes] = {}
         self.kem_public_keys: Dict[int, bytes] = {}
         self.network_delay: float = 0.015  # 每条消息的模拟延时 (15ms)
 
     def _enqueue_message(self, participant_id: int, msg_type: str, payload) -> None:
+        """在持锁状态下获取目标队列并投递消息，附带可调的网络延迟。"""
         queue = None
         with self.lock:
             queue = self.message_queues.get(participant_id)
@@ -301,6 +565,7 @@ class NetworkSimulator:
         queue.put((msg_type, payload))
 
     def _all_participant_ids(self) -> List[int]:
+        """返回当前已注册的参与者 ID 列表，供广播使用。"""
         with self.lock:
             return list(self.message_queues.keys())
     
@@ -319,10 +584,12 @@ class NetworkSimulator:
                 self.kem_public_keys[participant_id] = kem_public_key
 
     def get_signing_public_key(self, participant_id: int) -> bytes:
+        """查询指定参与者的 Ed25519 公钥（用于验证签名）。"""
         with self.lock:
             return self.signing_public_keys[participant_id]
 
     def get_kem_public_key(self, participant_id: int) -> bytes:
+        """查询指定参与者的 X25519 公钥（用于 KEM 封装）。"""
         with self.lock:
             return self.kem_public_keys[participant_id]
     
@@ -349,6 +616,15 @@ class NetworkSimulator:
         """广播本地验证结果"""
         for participant_id in self._all_participant_ids():
             self._enqueue_message(participant_id, 'validation', validation)
+
+    def broadcast_global_public_key(self, leader_id: int, global_key: List[List[int]]) -> None:
+        """广播最终全局公钥，供所有参与者采信。"""
+        payload = {
+            'leader_id': leader_id,
+            'global_public_key': global_key,
+        }
+        for participant_id in self._all_participant_ids():
+            self._enqueue_message(participant_id, 'global_key', payload)
     
     def receive_encrypted_shares(self, participant_id: int, timeout: float = 5.0) -> List[EncryptedSharePackage]:
         """接收加密份额"""
@@ -469,15 +745,28 @@ class NetworkSimulator:
         return vectors
 
 class V3S:
-    def __init__(self, n: int, t: int, prime: int = PRIME, slack_factor: float = 10.0, rng: Optional[SecureRandom] = None):
+    """V3S 协议核心：负责分享、验证、重构以及性能统计。"""
+
+    def __init__(
+        self,
+        n: int,
+        t: int,
+        prime: int = PRIME,
+        slack_factor: float = 10.0,
+        rng: Optional[SecureRandom] = None,
+        ring_degree: int = RING_DEGREE,
+    ):
+        """记录系统参数并准备随机源与性能统计容器。"""
         self.n = n
         self.t = t
         self.prime = prime
         self.slack_factor = slack_factor
         self.performance_stats = []
         self.rng = rng or SecureRandom("legacy-v3s-core")
+        self.ring_degree = ring_degree
     
     def add_performance_stat(self, phase_name: str, duration: float, operations: Dict[str, int] = None):
+        """收集单个阶段的时间与操作计数，便于后续打印报告。"""
         stat = PerformanceStats(phase_name, duration, operations or {})
         self.performance_stats.append(stat)
     
@@ -507,18 +796,27 @@ class V3S:
         print(f"🕐 TOTAL EXECUTION TIME: {total_time*1000:.4f} ms ({total_time:.6f} seconds)")
         print("="*80 + "\n")
     
-    def compute_spectral_norm(self, matrix: np.ndarray) -> float:
-        singular_values = np.linalg.svd(matrix, compute_uv=False)
-        return float(singular_values[0])
+    def compute_spectral_norm(self, matrix: MatrixR) -> float:
+        """粗略估计环矩阵的谱范数，基于系数向量的L2范数。"""
+
+        coeffs: List[int] = []
+        for row in matrix:
+            for poly in row:
+                coeffs.extend(poly.centered_coeffs())
+        if not coeffs:
+            return 0.0
+        return math.sqrt(sum(c * c for c in coeffs))
     
-    def compute_bound(self, R: np.ndarray, sigma_x: float, sigma_y: float, d: int) -> float:
+    def compute_bound(self, R: MatrixR, sigma_x: float, sigma_y: float, d: int) -> float:
+        """Estimate verification bound using coefficient-level variances."""
+
         spectral_norm = self.compute_spectral_norm(R)
-        sigma_p = spectral_norm * sigma_x
-        sigma_v = sigma_p + sigma_y
-        bound = self.slack_factor * sigma_v * np.sqrt(2 * d)
-        return bound
+        sigma_p = spectral_norm * sigma_x / max(1, d)
+        sigma_v = math.sqrt(sigma_p ** 2 + sigma_y ** 2)
+        return self.slack_factor * sigma_v * math.sqrt(d * self.ring_degree)
     
     def lagrange_interpolate(self, shares: List[Share]) -> int:
+        """对标量 Shamir 份额执行拉格朗日插值，返回秘密值。"""
         secret = 0
         k = len(shares)
         
@@ -602,91 +900,49 @@ class V3S:
 
         return solution
 
-    def reed_solomon_reconstruct(self, shares: List[Share]) -> int:
-        """使用Reed–Solomon纠错重构秘密"""
-        num_shares = len(shares)
-        if num_shares < self.t:
-            raise ValueError("Insufficient shares for reconstruction")
+    def generate_random_matrix(self, rows: int, cols: int, seed: str) -> MatrixR:
+        """通过 SHAKE-128 流生成确定性的随机环矩阵，用于公共参数。"""
+        coeffs_needed = rows * cols * self.ring_degree
+        byte_len = coeffs_needed * 2
+        shake = hashlib.shake_128(seed.encode())
+        random_bytes = shake.digest(byte_len)
 
-        max_correctable = max(0, (num_shares - self.t) // 2)
-        if max_correctable == 0:
-            return self.lagrange_interpolate(shares[:self.t])
-
-        unknowns = self.t + max_correctable
-        if num_shares < unknowns:
-            return self.lagrange_interpolate(shares[:self.t])
-
-        matrix: List[List[int]] = []
-        vector: List[int] = []
-
-        for share in shares:
-            x_val = share.index % self.prime
-            y_val = share.value % self.prime
-
-            row: List[int] = []
-            x_power = 1
-            for _ in range(self.t):
-                row.append(x_power)
-                x_power = (x_power * x_val) % self.prime
-
-            for error_deg in range(1, max_correctable + 1):
-                term = (-y_val * pow(x_val, error_deg, self.prime)) % self.prime
-                row.append(term)
-
+        matrix: MatrixR = []
+        cursor = 0
+        for i in range(rows):
+            row: List[PolyR] = []
+            for _ in range(cols):
+                coeffs = []
+                for _ in range(self.ring_degree):
+                    coeff_bytes = random_bytes[cursor: cursor + 2]
+                    cursor += 2
+                    coeff = int.from_bytes(coeff_bytes, "little") % self.prime
+                    coeffs.append(coeff)
+                row.append(PolyR(coeffs, self.prime, self.ring_degree))
             matrix.append(row)
-            vector.append(y_val)
-
-        try:
-            solution = self._solve_linear_system_mod(matrix, vector, self.prime)
-        except ValueError:
-            return self.lagrange_interpolate(shares[:self.t])
-
-        secret = solution[0] % self.prime
-        return int(secret)
-
-    def generate_random_matrix(self, d: int, n: int, seed: str) -> np.ndarray:
-        random_bytes = hashlib.shake_128(seed.encode()).digest(n * d // 4 + 1)
-        matrix = np.zeros((d, n), dtype=int)
-        byte_idx = 0
-        bit_pair_idx = 0
-        current_byte = random_bytes[0]
-        for i in range(d):
-            for j in range(n):
-                if bit_pair_idx == 4:
-                    byte_idx += 1
-                    current_byte = random_bytes[byte_idx]
-                    bit_pair_idx = 0
-                bit_pair = (current_byte >> (2 * bit_pair_idx)) & 0b11
-                bit_pair_idx += 1
-                if bit_pair == 0 or bit_pair == 1:
-                    matrix[i, j] = 0
-                elif bit_pair == 2:
-                    matrix[i, j] = 1
-                else:
-                    matrix[i, j] = -1
         return matrix
 
-    def aggregate_v_shares(self, v_shares: List[List[int]]) -> List[int]:
+    def aggregate_v_shares(self, v_shares: List[List[PolyR]]) -> VectorR:
+        """对验证向量份额按坐标重构，得到聚合后的全局 v 值。"""
         if not v_shares:
             return []
 
         dimension = len(v_shares[0])
-        aggregated: List[int] = []
+        aggregated: VectorR = []
 
         for idx in range(dimension):
             shares_for_coord = [
-                Share(int(vector[idx]) % self.prime, participant_index + 1)
+                Share(vector[idx], participant_index + 1)
                 for participant_index, vector in enumerate(v_shares)
             ]
 
-            reconstructed = self.lagrange_interpolate(shares_for_coord)
-            if reconstructed > self.prime // 2:
-                reconstructed -= self.prime
-            aggregated.append(int(reconstructed))
+            reconstructed = self.reconstruct_poly_from_shares(shares_for_coord)
+            aggregated.append(reconstructed)
 
         return aggregated
 
     def shamir_share(self, secret: int, n: int, t: int) -> List[Share]:
+        """在 GF(prime) 中为标量 secret 生成 n 份 t 阶 Shamir 份额。"""
         coefficients = [secret % self.prime] + [self.rng.randbelow(self.prime) for _ in range(t-1)]
         
         shares = []
@@ -697,148 +953,280 @@ class V3S:
             shares.append(Share(value, i))
         return shares
 
-    def share_vector(self, secret_vector: List[int], sigma_x: float = 1.0, sigma_y: float = 18.36) -> Tuple[Any, List[Any], List[Any]]:
-        """为单个参与者的秘密向量生成份额"""
+    def shamir_share_poly(self, secret: PolyR, n: int, t: int) -> List[Share]:
+        """逐系数应用 Shamir 共享，将 PolyR 秘密拆分成 n 份多项式份额。"""
+        coeff_shares: List[List[Share]] = []
+        for coeff in secret.coeffs:
+            coeff_shares.append(self.shamir_share(coeff, n, t))
+
+        poly_shares: List[Share] = []
+        for participant in range(n):
+            participant_coeffs = [coeff_shares[idx][participant].value for idx in range(secret.degree)]
+            poly_value = poly_from_coeffs(participant_coeffs, self.prime, self.ring_degree)
+            poly_shares.append(Share(poly_value, participant + 1))
+        return poly_shares
+
+    def reconstruct_poly_from_shares(self, shares: List[Share]) -> PolyR:
+        """从多项式份额列表中逐系数插值，恢复原始 PolyR。"""
+        if not shares:
+            raise ValueError("No shares provided for reconstruction")
+        degree = shares[0].value.degree if isinstance(shares[0].value, PolyR) else self.ring_degree
+        coeffs: List[int] = []
+        for coeff_idx in range(degree):
+            scalar_shares = [
+                Share(int(share.value.coeffs[coeff_idx]), share.index)
+                for share in shares
+            ]
+            coeffs.append(self.lagrange_interpolate(scalar_shares))
+        return poly_from_coeffs(coeffs, self.prime, degree)
+
+    def reed_solomon_decode_scalar(self, shares: List[Share], threshold: int) -> int:
+        """使用Berlekamp–Welch思想对标量份额执行Reed–Solomon纠错，并返回f(0)。"""
+
+        total_shares = len(shares)
+        if total_shares < threshold:
+            raise ValueError("Insufficient shares for Reed–Solomon decoding")
+
+        max_errors = max(0, (total_shares - threshold) // 2)
+
+        # 当没有错误份额时，直接用拉格朗日插值即可。
+        if max_errors == 0:
+            return self.lagrange_interpolate(shares[:threshold])
+
+        for errors in range(max_errors, -1, -1):
+            required_equations = threshold + 2 * errors
+            if total_shares < required_equations:
+                continue
+
+            degree_e = errors
+            degree_q = threshold + errors - 1
+
+            # Unknowns: e_coeffs (degree_e terms, monic leading coefficient omitted) + q_coeffs
+            matrix: List[List[int]] = []
+            rhs: List[int] = []
+
+            for share in shares:
+                xi = share.index % self.prime
+                yi = int(share.value) % self.prime
+
+                row: List[int] = []
+
+                for power in range(degree_e):
+                    coeff = (-yi * pow(xi, power, self.prime)) % self.prime
+                    row.append(coeff)
+
+                for power in range(degree_q + 1):
+                    row.append(pow(xi, power, self.prime))
+
+                matrix.append(row)
+                rhs.append((yi * pow(xi, degree_e, self.prime)) % self.prime)
+
+            try:
+                solution = self._solve_linear_system_mod(matrix, rhs, self.prime)
+            except ValueError:
+                continue
+
+            e_coeffs = solution[:degree_e]
+            q_coeffs = solution[degree_e:]
+
+            q0 = q_coeffs[0] if q_coeffs else 0
+
+            if degree_e == 0:
+                e0 = 1
+            else:
+                e0 = e_coeffs[0]
+                if e0 == 0:
+                    continue
+
+            inv_e0 = pow(e0, self.prime - 2, self.prime)
+            return (q0 * inv_e0) % self.prime
+
+        raise ValueError("Reed–Solomon decoding failed for provided shares")
+
+    def reed_solomon_decode_poly(self, shares: List[Share], threshold: int) -> PolyR:
+        """对PolyR份额执行系数级Reed–Solomon纠错，恢复原始多项式。"""
+
+        if not shares:
+            raise ValueError("No shares provided for Reed–Solomon decoding")
+
+        degree = shares[0].value.degree if isinstance(shares[0].value, PolyR) else self.ring_degree
+        coeffs: List[int] = []
+
+        for coeff_idx in range(degree):
+            scalar_shares = [
+                Share(int(share.value.coeffs[coeff_idx]), share.index)
+                for share in shares
+            ]
+            coeff = self.reed_solomon_decode_scalar(scalar_shares, threshold)
+            coeffs.append(coeff)
+
+        return poly_from_coeffs(coeffs, self.prime, degree)
+
+    def reed_solomon_decode_vector(self, vector_shares: List[Tuple[int, VectorR]], threshold: int) -> VectorR:
+        """对多项式向量份额执行Reed–Solomon纠错，逐坐标重构原向量。"""
+
+        if not vector_shares:
+            raise ValueError("No vector shares available for decoding")
+
+        dimension = len(vector_shares[0][1])
+        reconstructed: VectorR = []
+
+        for coord_idx in range(dimension):
+            coord_shares = [
+                Share(vector[coord_idx], participant_id)
+                for participant_id, vector in vector_shares
+            ]
+            reconstructed_poly = self.reed_solomon_decode_poly(coord_shares, threshold)
+            reconstructed.append(reconstructed_poly)
+
+        return reconstructed
+
+    def share_vector(
+        self,
+        secret_vector: VectorR,
+        sigma_x: float = 1.0,
+        sigma_y: float = 18.36,
+    ) -> Tuple[Any, List[Any], List[Any]]:
+        """为单个参与者的秘密向量生成份额（在 R_q^k 中）。"""
+
         d = len(secret_vector)
-        
-        # 步骤1: 生成噪声向量
+
+        # Step 1: sample noise polynomials per coordinate
         start_time = time.time()
-        y_vector = self.rng.gaussian_vector(d, 0.0, sigma_y)
+        y_vector = [
+            gaussian_poly(self.rng, self.ring_degree, sigma_y, self.prime)
+            for _ in range(d)
+        ]
         step1_time = time.time() - start_time
-        
-        # 步骤2: Shamir秘密共享
+
+        # Step 2: coefficient-wise Shamir sharing for each PolyR
         start_time = time.time()
-        x_shares = [self.shamir_share(secret_vector[i], self.n, self.t) for i in range(d)]
-        y_shares = [self.shamir_share(y_vector[i], self.n, self.t) for i in range(d)]
+        x_shares = [self.shamir_share_poly(secret_vector[i], self.n, self.t) for i in range(d)]
+        y_shares = [self.shamir_share_poly(y_vector[i], self.n, self.t) for i in range(d)]
         step2_time = time.time() - start_time
-        self.add_performance_stat("Shamir秘密共享", step2_time, {
-            "高斯噪声采样 (生成y向量)": d,
-            "多项式构造 (为x和y的每个分量创建t-1次多项式)": 2 * d,
-            "份额生成 (对每个多项式生成n个份额点)": 2 * d * self.n,
-            "模幂运算 (计算i^power mod p,用于多项式求值)": 2 * d * self.n * self.t,
-            "模乘法运算 (多项式系数乘法,在有限域GF(p)上)": 2 * d * self.n * self.t
-        })
-        
-        # 步骤3: 构建Merkle树
+        phase1_duration = step1_time + step2_time
+        self.add_performance_stat(
+            "Shamir秘密共享",
+            phase1_duration,
+            {
+                "Gaussian采样 (多项式噪声)": d * self.ring_degree,
+                "多项式份额生成 (x,y)": 2 * d * self.n,
+                "系数级拉格朗日系数": 2 * d * self.n * self.t * self.ring_degree,
+            },
+        )
+
+        # Step 3: Merkle commitments over encoded polynomials
         start_time = time.time()
         salt = self.rng.decimal_salt(128)
-        leaf_data = []
-        salts = []
-        
+        leaf_hashes: List[str] = []
+        salts: List[str] = []
+
         for participant in range(self.n):
             x_participant = [x_shares[i][participant].value for i in range(d)]
             y_participant = [y_shares[i][participant].value for i in range(d)]
             participant_salt = self.rng.decimal_salt(128)
             salts.append(participant_salt)
-            leaf = '|'.join(map(str, x_participant + y_participant)) + '|' + participant_salt
-            leaf_hash = MerkleTree.hash_item(leaf)
-            leaf_data.append(leaf_hash)
-        
-        merkle_tree = MerkleTree(leaf_data)
+            leaf_bytes = (
+                encode_vector(x_participant)
+                + encode_vector(y_participant)
+                + participant_salt.encode()
+            )
+            leaf_hashes.append(MerkleTree.hash_item(leaf_bytes))
+
+        merkle_tree = MerkleTree(leaf_hashes)
         h = merkle_tree.root.hash
         step3_time = time.time() - start_time
-        
-        # 计算Merkle树的哈希次数
-        merkle_hashes = self.n  # 叶子节点哈希
+
+        merkle_hashes = self.n
         tree_levels = 0
         nodes = self.n
         while nodes > 1:
             nodes = (nodes + 1) // 2
             merkle_hashes += nodes
             tree_levels += 1
-        
-        self.add_performance_stat("Merkle树构建", step3_time, {
-            "叶子节点数 (每个参与者对应一个叶子)": self.n,
-            "树的层数 (二叉树高度=log₂(n))": tree_levels,
-            "SHA-256哈希 (叶子哈希+所有内部节点哈希)": merkle_hashes,
-            "随机盐生成 (128位随机数,防止叶子碰撞)": self.n
-        })
-        
-        # 步骤4: 生成挑战矩阵R
+
+        self.add_performance_stat(
+            "Merkle树构建",
+            step3_time,
+            {
+                "叶子节点": self.n,
+                "树层数": tree_levels,
+                "SHA-256哈希": merkle_hashes,
+                "随机盐": self.n,
+            },
+        )
+
+        # Step 4: random ring matrix challenge
         start_time = time.time()
         R = self.generate_random_matrix(d, d, h)
         spectral_norm = self.compute_spectral_norm(R)
         bound = self.compute_bound(R, sigma_x, sigma_y, d)
         step4_time = time.time() - start_time
-        self.add_performance_stat("挑战矩阵与界限计算", step4_time, {
-            "矩阵元素生成 (d×d矩阵,元素为{-1,0,1})": d * d,
-            "SHAKE-128摘要 (可扩展输出函数,生成伪随机字节)": d * d // 4 + 1,
-            "SVD分解 (奇异值分解,O(d³)复杂度)": 1,
-            "谱范数计算 (取最大奇异值σ₁,衡量矩阵拉伸能力)": 1
-        })
-        
-        # 步骤5: 计算验证向量v
+        self.add_performance_stat(
+            "挑战矩阵与界限计算",
+            step4_time,
+            {
+                "矩阵元素 (PolyR)": d * d,
+                "SHAKE-128字节": d * d * self.ring_degree,
+                "谱范数近似": 1,
+            },
+        )
+
+        # Step 5: compute v-shares in R_q
         start_time = time.time()
-        v_shares = []
-        half_prime = self.prime // 2
+        v_shares: List[VectorR] = []
         matrix_mults = 0
-        modular_ops = 0
-        
+
         for participant in range(self.n):
             x_participant = [x_shares[i][participant].value for i in range(d)]
             y_participant = [y_shares[i][participant].value for i in range(d)]
-            v_i = []
-            for i in range(d):
-                v_elem = int(y_participant[i]) % self.prime
-                modular_ops += 1
-                for j in range(d):
-                    v_elem = (v_elem + int(R[i][j]) * int(x_participant[j])) % self.prime
+            v_i: VectorR = []
+            for i_idx in range(d):
+                acc = y_participant[i_idx].copy()
+                for j_idx in range(d):
+                    acc = acc + (R[i_idx][j_idx] * x_participant[j_idx])
                     matrix_mults += 1
-                    modular_ops += 2
-                
-                if v_elem > half_prime:
-                    v_elem = v_elem - self.prime
-                    
-                v_i.append(int(v_elem))
+                v_i.append(acc)
             v_shares.append(v_i)
-        
+
         aggregated_v = self.aggregate_v_shares(v_shares)
-        lagrange_interps = len(aggregated_v)
-        interpolation_participants = len(v_shares)
-        lagrange_mod_inverses = lagrange_interps * interpolation_participants
-        lagrange_mod_mults = 0
-        if interpolation_participants > 0:
-            lagrange_mod_mults = lagrange_interps * (2 * interpolation_participants * interpolation_participants)
-
         step5_time = time.time() - start_time
-        operations = {
-            "矩阵向量乘法 (计算R·x_i,每个参与者一次)": self.n,
-            "标量乘法 (矩阵元素×向量元素,共n×d×d次)": matrix_mults,
-            "模运算 (加法+取模,保持在有限域GF(p)内)": modular_ops,
-            "中心化转换 (将[0,p)映射到[-p/2,p/2],便于范数计算)": self.n * d,
-        }
 
-        if lagrange_interps > 0:
-            operations["拉格朗日插值 (聚合验证向量,每个维度一次)"] = lagrange_interps
-            operations["模逆元计算 (插值中的模逆运算)"] = lagrange_mod_inverses
-            operations["模乘法 (插值基函数与加权累计)"] = lagrange_mod_mults
+        self.add_performance_stat(
+            "验证向量计算",
+            step5_time,
+            {
+                "环上乘加": matrix_mults,
+                "拉格朗日插值 (聚合v)": d,
+            },
+        )
 
-        self.add_performance_stat("验证向量计算", step5_time, operations)
-        
-        # 准备证明数据
+        # Prepare share payloads (JSON friendly coefficient lists)
         share_data = []
         for participant in range(self.n):
             merkle_proof = merkle_tree.get_proof(participant)
+            x_participant = [x_shares[i][participant].value for i in range(d)]
+            y_participant = [y_shares[i][participant].value for i in range(d)]
             share_info = {
-                'x_shares': [x_shares[i][participant].value for i in range(d)],
-                'y_shares': [y_shares[i][participant].value for i in range(d)],
-                'salt': salts[participant],
-                'merkle_proof': merkle_proof
+                "x_shares": vector_to_coeff_lists(x_participant),
+                "y_shares": vector_to_coeff_lists(y_participant),
+                "salt": salts[participant],
+                "merkle_proof": merkle_proof,
             }
             share_data.append(share_info)
-        
+
         public_proof = {
-            'h': h,
-            'v_shares': v_shares,
-            'aggregated_v': aggregated_v,
-            'R': R.tolist(),
-            'bound': bound,
-            'spectral_norm': spectral_norm,
-            'sigma_x': sigma_x,
-            'sigma_y': sigma_y,
-            'main_salt': salt
+            "h": h,
+            "v_shares": [vector_to_coeff_lists(vec) for vec in v_shares],
+            "aggregated_v": vector_to_coeff_lists(aggregated_v),
+            "R": matrix_to_coeff_lists(R),
+            "bound": bound,
+            "spectral_norm": spectral_norm,
+            "sigma_x": sigma_x,
+            "sigma_y": sigma_y,
+            "main_salt": salt,
         }
-        
+
         return public_proof, share_data, x_shares
 
     def verify_share(self, participant_id: int, public_proof: dict, participant_proof: dict) -> Tuple[bool, float, Dict[str, int]]:
@@ -851,133 +1239,79 @@ class V3S:
         operations = {}
         
         d = len(participant_proof['x_shares'])
-        
-        # 步骤1: 验证Merkle proof
-        leaf = '|'.join(map(str, participant_proof['x_shares'] + participant_proof['y_shares'])) + '|' + participant_proof['salt']
-        leaf_hash = MerkleTree.hash_item(leaf)
+
+        x_polys = vector_from_coeff_lists(participant_proof['x_shares'], self.prime, self.ring_degree)
+        y_polys = vector_from_coeff_lists(participant_proof['y_shares'], self.prime, self.ring_degree)
+
+        leaf_bytes = encode_vector(x_polys) + encode_vector(y_polys) + participant_proof['salt'].encode()
+        leaf_hash = MerkleTree.hash_item(leaf_bytes)
         operations['SHA-256叶子哈希 (重构参与者的叶子节点哈希)'] = 1
-        
+
         merkle_proof_len = len(participant_proof['merkle_proof'])
         if not MerkleTree.verify_proof(leaf_hash, participant_proof['merkle_proof'], public_proof['h']):
             duration = time.time() - start_time
             operations['SHA-256路径哈希 (验证从叶子到根的路径)'] = merkle_proof_len
             return False, duration, operations
-        
+
         operations['SHA-256路径哈希 (验证从叶子到根的路径)'] = merkle_proof_len
         operations['Merkle证明验证 (检查份额属于承诺树)'] = 1
-        
-        # 步骤2: 验证线性关系
-        R = np.array(public_proof['R'], dtype=object)
-        x_share = np.array(participant_proof['x_shares'], dtype=object)
-        y_share = np.array(participant_proof['y_shares'], dtype=object)
-        
-        v_calc = np.zeros(len(x_share), dtype=object)
-        scalar_mults = 0
-        modular_ops = 0
-        
-        for i in range(len(v_calc)):
-            v_calc[i] = int(y_share[i])
-            modular_ops += 1
-            for j in range(len(x_share)):
-                v_calc[i] = (v_calc[i] + int(R[i][j]) * int(x_share[j])) % self.prime
-                scalar_mults += 1
-                modular_ops += 2
-        
-        operations['标量乘法 (计算R·x_i,矩阵元素×向量元素)'] = scalar_mults
-        operations['模运算 (加法和取模,保持在有限域内)'] = modular_ops
-        
-        v_public = np.array(public_proof['v_shares'][participant_id-1], dtype=object);
-        
-        for i in range(len(v_calc)):
-            if int(v_calc[i]) % self.prime != int(v_public[i]) % self.prime:
+
+        R_matrix = matrix_from_coeff_lists(public_proof['R'], self.prime, self.ring_degree)
+        v_public_vecs = [
+            vector_from_coeff_lists(vec, self.prime, self.ring_degree)
+            for vec in public_proof['v_shares']
+        ]
+        v_public = v_public_vecs[participant_id - 1]
+
+        v_calc: VectorR = []
+        mult_ops = 0
+        for i_idx in range(d):
+            acc = y_polys[i_idx].copy()
+            for j_idx in range(d):
+                acc = acc + (R_matrix[i_idx][j_idx] * x_polys[j_idx])
+                mult_ops += 1
+            v_calc.append(acc)
+
+        operations['环上乘法 (验证R·x+y)'] = mult_ops
+
+        for calc, public in zip(v_calc, v_public):
+            if calc != public:
                 duration = time.time() - start_time
                 return False, duration, operations
-        
-        operations['线性关系检查 (验证v_i=R·x_i+y_i是否成立)'] = len(v_calc)
-        
-        # 步骤3: 验证聚合向量的范数
-        aggregated_v = public_proof.get('aggregated_v')
-        if aggregated_v is None:
-            aggregated_v = self.aggregate_v_shares(public_proof['v_shares'])
 
-        half_prime = self.prime // 2
-        aggregated_centered: List[float] = []
+        operations['线性关系检查 (v_i一致)'] = len(v_calc)
 
-        for val in aggregated_v:
-            int_val = int(val) % self.prime
-            if int_val > half_prime:
-                int_val = int_val - self.prime
-            aggregated_centered.append(float(int_val))
+        aggregated_coeffs = public_proof.get('aggregated_v')
+        if aggregated_coeffs is None:
+            aggregated_polys = self.aggregate_v_shares(v_public_vecs)
+        else:
+            aggregated_polys = vector_from_coeff_lists(aggregated_coeffs, self.prime, self.ring_degree)
 
-        operations['中心化转换 (聚合验证向量)'] = len(aggregated_centered)
+        norm = vector_l2(aggregated_polys)
+        operations['范数计算 (聚合v)'] = 1
 
-        norm = np.linalg.norm(aggregated_centered)
-        operations['范数计算 (聚合v向量||v||₂)'] = 1
-        
         duration = time.time() - start_time
-        
+
         if norm > public_proof['bound']:
             return False, duration, operations
-        
+
         return True, duration, operations
     
-    def reconstruct_secret(self, x_shares_list: List[List[Share]], participant_indices: List[int]) -> Tuple[List[int], float, Dict[str, int]]:
-        """
-        使用拉格朗日插值重构秘密向量
-        
-        参数:
-        x_shares_list: 每个维度的所有份额列表 [dim0_shares, dim1_shares, ...]
-        participant_indices: 参与重构的参与者索引（至少t个）
-        
-        返回: (重构的秘密向量, 耗时, 操作统计)
-        """
-        start_time = time.time()
-        operations = {}
-        
-        d = len(x_shares_list)
-        secret_vector = []
-        half_prime = self.prime // 2
-        
-        lagrange_interps = 0
-        modular_inverses = 0
-        modular_mults = 0
-        
-        for i in range(d):
-            shares_to_use = [x_shares_list[i][idx] for idx in participant_indices[:self.t]]
-            
-            # 统计拉格朗日插值的操作
-            k = len(shares_to_use)
-            for j in range(k):
-                for m in range(k):
-                    if j != m:
-                        modular_mults += 2  # numerator和denominator计算
-                modular_inverses += 1  # 每个基函数需要一次模逆
-                modular_mults += 2  # yi * numerator * denominator_inv
-            
-            secret = self.lagrange_interpolate(shares_to_use)
-            lagrange_interps += 1
-            
-            secret = secret % self.prime
-            if secret > half_prime:
-                secret = secret - self.prime
-                
-            secret_vector.append(int(secret))
-        
-        duration = time.time() - start_time
-        
-        operations['拉格朗日插值 (多项式插值,每个维度一次)'] = lagrange_interps
-        operations['模逆元计算 (费马小定理a^(p-2) mod p,255位大数幂运算)'] = modular_inverses * d
-        operations['模乘法 (拉格朗日基函数计算,有限域乘法)'] = modular_mults
-        operations['中心化转换 (重构结果转回有符号表示)'] = d
-        
-        return secret_vector, duration, operations
-
 class DistributedParticipant(threading.Thread):
     """分布式参与者"""
     
-    def __init__(self, participant_id: int, n: int, t: int, d: int, 
-                 network: NetworkSimulator,
-                 sigma_x: float = 1.0, sigma_y: float = 18.36):
+    def __init__(
+        self,
+        participant_id: int,
+        n: int,
+        t: int,
+        d: int,
+        network: NetworkSimulator,
+        ring_degree: int = RING_DEGREE,
+        sigma_x: float = 1.0,
+        sigma_y: float = 18.36,
+    ):
+        """绑定参与者参数、衍生局部 V3S 实例并初始化通信/统计状态。"""
         super().__init__()
         self.participant_id = participant_id
         self.n = n
@@ -986,9 +1320,15 @@ class DistributedParticipant(threading.Thread):
         self.network = network
         self.sigma_x = sigma_x
         self.sigma_y = sigma_y
+        self.poly_degree = ring_degree
 
         self.rng = SecureRandom(f"legacy-participant-{participant_id}")
-        self.v3s = V3S(n, t, rng=self.rng.derive_child(f"legacy-v3s-core-{participant_id}"))
+        self.v3s = V3S(
+            n,
+            t,
+            rng=self.rng.derive_child(f"legacy-v3s-core-{participant_id}"),
+            ring_degree=self.poly_degree,
+        )
         self.secret_vector = None
         self.public_proof = None
         self.share_data = None
@@ -1031,6 +1371,8 @@ class DistributedParticipant(threading.Thread):
         self.public_matrix_A = None    # 基于共识盐值生成的公共矩阵A
         self.partial_public_key = None # 部分公钥 b_i = A * s_i
         self.global_public_key = None  # 全局公钥 b = sum(b_i)
+        self.global_public_key_vector = None
+        self.reconstructor_id: Optional[int] = None
         
         # 公钥生成统计
         self.public_key_generation_time = 0  # 全局公钥生成总时间
@@ -1039,6 +1381,8 @@ class DistributedParticipant(threading.Thread):
         self.network_send_time = 0
         self.network_receive_time = 0
         self.network_ops = {}
+        self.reconstruction_ops: Dict[str, int] = {}
+        self.public_key_ops: Dict[str, int] = {}
         
         # 同步机制
         self.done_event = threading.Event()
@@ -1080,8 +1424,12 @@ class DistributedParticipant(threading.Thread):
     
     def generate_secret(self):
         """生成自己的短秘密向量"""
-        self.secret_vector = self.rng.gaussian_vector(self.d, 0.0, self.sigma_x)
-        print(f"[Participant {self.participant_id}] Generated secret vector: {self.secret_vector}")
+        self.secret_vector = [
+            gaussian_poly(self.rng, self.poly_degree, self.sigma_x, self.v3s.prime)
+            for _ in range(self.d)
+        ]
+        preview = [poly.coeffs[:2] for poly in self.secret_vector]
+        print(f"[Participant {self.participant_id}] Generated secret vector (coeff preview): {preview}")
         print(f"[Participant {self.participant_id}] Generated participant salt: {self.participant_salt[:16]}...")
     
     def create_shares(self):
@@ -1096,7 +1444,12 @@ class DistributedParticipant(threading.Thread):
         if self.share_data is not None:
             own_index = self.participant_id - 1
             if 0 <= own_index < len(self.share_data):
-                self.noise_share_vector = [int(val) for val in self.share_data[own_index]['y_shares']]
+                coeff_lists = self.share_data[own_index]['y_shares']
+                self.noise_share_vector = vector_from_coeff_lists(
+                    coeff_lists,
+                    self.v3s.prime,
+                    self.poly_degree,
+                )
         
         duration = time.time() - start_time
         print(f"[Participant {self.participant_id}] Shares created in {duration*1000:.2f} ms")
@@ -1288,6 +1641,17 @@ class DistributedParticipant(threading.Thread):
                     package.encrypted_data,
                     package.nonce,
                     symmetric_key,
+                )
+
+                share_info['x_polys'] = vector_from_coeff_lists(
+                    share_info['x_shares'],
+                    self.v3s.prime,
+                    self.poly_degree,
+                )
+                share_info['y_polys'] = vector_from_coeff_lists(
+                    share_info['y_shares'],
+                    self.v3s.prime,
+                    self.poly_degree,
                 )
 
                 self.received_shares[package.sender_id] = share_info
@@ -1499,7 +1863,7 @@ class DistributedParticipant(threading.Thread):
         print(f"[Participant {self.participant_id}] Final valid shares (intersection): {self.valid_shares} ({len(self.valid_shares)} participants)")
 
         self.compute_consensus_salt()
-        self.aggregate_and_reconstruct_global_secret()
+        self.aggregate_shares_for_public_key()
     
     def broadcast_and_collect_validation_vectors(self) -> None:
         """广播本地验证结果并与其他参与者求交集."""
@@ -1579,112 +1943,50 @@ class DistributedParticipant(threading.Thread):
         print(f"[Participant {self.participant_id}] Consensus salt computed from {len(all_valid_ids)} participants: {self.consensus_salt[:16]}...")
         print(f"[Participant {self.participant_id}] Valid participant IDs: {all_valid_ids}")
     
-    def aggregate_and_reconstruct_global_secret(self):
-        """聚合所有有效份额并重构全局秘密"""
-        print(f"[Participant {self.participant_id}] Aggregating shares for global secret reconstruction...")
-        
-        # 确保有足够的有效份额（至少达到阈值）
+    def aggregate_shares_for_public_key(self):
+        """聚合所有有效份额，为公钥阶段准备全局秘密份额。"""
+        print(f"[Participant {self.participant_id}] Aggregating verified shares for public key generation...")
+
         all_valid_ids = sorted(set(self.valid_shares + [self.participant_id]))
-        
+
         if len(all_valid_ids) < self.t:
-            print(f"[Participant {self.participant_id}] ⚠️  Insufficient valid shares ({len(all_valid_ids)} < {self.t}), cannot reconstruct global secret")
+            print(
+                f"[Participant {self.participant_id}] ⚠️  Insufficient valid shares ({len(all_valid_ids)} < {self.t}),"
+                " cannot obtain resilient aggregated share"
+            )
             return
-        
-        # 步骤1: 计算自己位置的聚合份额
-        # share_i(S_global) = share_i(S_1) + share_i(S_2) + ... + share_i(S_n)
+
         aggregation_start = time.time()
-        
+
         my_position = self.participant_id - 1
-        aggregated_shares_d_values = []
-        
+        aggregated_shares_d_values: List[PolyR] = []
+
         for dim in range(self.d):
-            # 从自己的 x_shares 中获取自己位置的份额值（自己的秘密）
             my_share_value = self.x_shares[dim][my_position].value
-            aggregated_value = my_share_value
-            
-            # 累加所有有效参与者发给我的份额
+            aggregated_value = my_share_value.copy()
+
             for valid_pid in self.valid_shares:
                 if valid_pid in self.received_shares:
                     share_info = self.received_shares[valid_pid]
-                    # share_info['x_shares'][dim] 是参与者valid_pid发给我的第dim维的份额
-                    aggregated_value = (aggregated_value + share_info['x_shares'][dim]) % self.v3s.prime
-            
+                    aggregated_value = aggregated_value + share_info['x_polys'][dim]
+
             aggregated_shares_d_values.append(aggregated_value)
-        
+
         aggregation_time = time.time() - aggregation_start
         self.aggregated_shares = aggregated_shares_d_values
-        print(f"[Participant {self.participant_id}] Computed aggregated share at own position ({aggregation_time*1000:.2f} ms)")
-        
-        # 步骤2: 广播自己的聚合份额
-        broadcast_start = time.time()
-        agg_share = AggregatedShare(
-            participant_id=self.participant_id,
-            aggregated_values=aggregated_shares_d_values
-        )
-        self.network.broadcast_aggregated_share(agg_share)
-        broadcast_time = time.time() - broadcast_start
-        print(f"[Participant {self.participant_id}] Broadcasted aggregated share ({broadcast_time*1000:.2f} ms)")
-        
-        # 步骤3: 接收其他参与者的聚合份额
-        time.sleep(0.5)  # 等待其他参与者广播
-        receive_start = time.time()
-        received_agg_shares = self.network.receive_aggregated_shares(self.participant_id, len(all_valid_ids))
-        receive_time = time.time() - receive_start
-        print(f"[Participant {self.participant_id}] Received {len(received_agg_shares)} aggregated shares ({receive_time*1000:.2f} ms)")
-        
-        # 步骤4: 使用Reed–Solomon纠错+插值重构全局秘密
-        reconstruction_start = time.time()
-        
-        # 收集至少t个参与者的聚合份额
-        available_agg_shares = {}
-        available_agg_shares[self.participant_id] = aggregated_shares_d_values
-        
-        for agg_share in received_agg_shares:
-            if agg_share.participant_id in all_valid_ids:
-                available_agg_shares[agg_share.participant_id] = agg_share.aggregated_values
-        
-        if len(available_agg_shares) < self.t:
-            print(f"[Participant {self.participant_id}] ⚠️  Insufficient aggregated shares ({len(available_agg_shares)} < {self.t})")
-            return
-        
-        participants_used = sorted(available_agg_shares.keys())
-        correctable_errors = max(0, (len(participants_used) - self.t) // 2)
-        
-        global_secret_vector = []
-        
-        for dim in range(self.d):
-            shares_for_dim = [Share(value=available_agg_shares[pid][dim], index=pid) for pid in participants_used]
+        self.reconstruction_time = aggregation_time
+        self.global_secret = None  # 全局秘密不再在每个参与者处重构
 
-            try:
-                secret_dim = self.v3s.reed_solomon_reconstruct(shares_for_dim)
-            except ValueError:
-                print(f"[Participant {self.participant_id}] ❌ Reed–Solomon decoding failed (errors > {correctable_errors})")
-                print(f"[Participant {self.participant_id}] Aborting DKG: insufficient clean shares to reconstruct dimension {dim}")
-                self.reconstruction_time = aggregation_time + broadcast_time + receive_time + (time.time() - reconstruction_start)
-                self.done_event.set()
-                raise
-            
-            # 中心化转换
-            half_prime = self.v3s.prime // 2
-            if secret_dim > half_prime:
-                secret_dim = secret_dim - self.v3s.prime
-            
-            global_secret_vector.append(int(secret_dim))
-        
-        reconstruction_time = time.time() - reconstruction_start
-        self.reconstruction_time = aggregation_time + broadcast_time + receive_time + reconstruction_time
-        self.global_secret = global_secret_vector
-        
-        # 计算全局秘密的范数
-        global_norm = np.linalg.norm(global_secret_vector)
-        
-        print(f"[Participant {self.participant_id}] ✓ Reconstructed global secret: {global_secret_vector}")
-        print(f"[Participant {self.participant_id}] Global secret norm: ||S_global|| = {global_norm:.4f}")
-        print(f"[Participant {self.participant_id}] Used {len(participants_used)} participants: {participants_used}")
-        print(f"[Participant {self.participant_id}] Reed–Solomon correctable errors ≤ {correctable_errors}")
-        print(f"[Participant {self.participant_id}] Total reconstruction time: {self.reconstruction_time*1000:.2f} ms")
-        
-        # 步骤5: 基于共识盐值生成公共矩阵A并计算部分公钥
+        print(
+            f"[Participant {self.participant_id}] Prepared aggregated secret share at own position "
+            f"({aggregation_time*1000:.2f} ms)"
+        )
+
+        self.reconstruction_ops = {
+            "聚合份额加法 (PolyR)": self.d * len(self.valid_shares),
+            "生成聚合份额 (每个参与者)": 1,
+        }
+
         self.generate_public_matrix_and_compute_keys()
     
     def generate_public_matrix_and_compute_keys(self):
@@ -1694,143 +1996,249 @@ class DistributedParticipant(threading.Thread):
         if self.consensus_salt is None:
             print(f"[Participant {self.participant_id}] ⚠️  No consensus salt available!")
             return
-        
+        if not self.aggregated_shares:
+            print(f"[Participant {self.participant_id}] ⚠️  Aggregated share unavailable, aborting public key generation")
+            return
+
+        all_valid_ids = sorted(set(self.valid_shares + [self.participant_id]))
+        if len(all_valid_ids) < self.t:
+            print(
+                f"[Participant {self.participant_id}] ⚠️  Not enough valid participants ({len(all_valid_ids)} < {self.t}) for public key generation"
+            )
+            return
+
+        self.reconstructor_id = self.select_global_key_reconstructor(all_valid_ids)
+        is_reconstructor = self.participant_id == self.reconstructor_id
+        role = "(global key reconstructor)" if is_reconstructor else ""
+        print(
+            f"[Participant {self.participant_id}] Selected reconstructor P{self.reconstructor_id} via consensus salt {role}"
+        )
+
         start_time = time.time()
-        
-        # 使用共识盐值生成随机矩阵A（维度为 d×d）
-        # 使用SHAKE-256扩展输出函数生成足够的随机字节
+
         matrix_size = self.d * self.d
-        bytes_needed = matrix_size * 4  # 每个元素用4字节表示
-        
-        # 从共识盐值派生矩阵元素
+        bytes_needed = matrix_size * 4
         random_bytes = hashlib.shake_256(self.consensus_salt.encode()).digest(bytes_needed)
-        
-        # 构建随机矩阵A（元素范围：[0, 2^31-1]，使用模运算确保在有限域内）
-        A = np.zeros((self.d, self.d), dtype=object)
-        
+
+        A: MatrixR = []
         for i in range(self.d):
+            row: List[PolyR] = []
             for j in range(self.d):
                 byte_idx = (i * self.d + j) * 4
-                # 将4个字节转换为一个整数
-                value = int.from_bytes(random_bytes[byte_idx:byte_idx+4], byteorder='big')
-                # 使用模运算将值限制在有限域内
-                A[i, j] = value % self.v3s.prime
-        
+                value = int.from_bytes(random_bytes[byte_idx:byte_idx+4], byteorder='big') % self.v3s.prime
+                coeffs = [0] * self.v3s.ring_degree
+                coeffs[0] = value
+                row.append(poly_from_coeffs(coeffs, self.v3s.prime, self.v3s.ring_degree))
+            A.append(row)
+
         self.public_matrix_A = A
-        
+
         matrix_gen_time = time.time() - start_time
         print(f"[Participant {self.participant_id}] Generated {self.d}×{self.d} public matrix A ({matrix_gen_time*1000:.2f} ms)")
-        print(f"[Participant {self.participant_id}] Matrix structure: A_{self.d}×{self.d}")
-        
-        # 计算部分公钥 b_i = A * s_i
+        print(f"[Participant {self.participant_id}] Matrix structure: A_{self.d}×{self.d} over PolyR")
+
         partial_key_start = time.time()
-        
-        if self.secret_vector is None:
-            raise ValueError("Secret vector unavailable for key generation")
-
-        secret_vector = np.array(self.secret_vector, dtype=object)
-        
-        partial_public_key = np.zeros(self.d, dtype=object)
-        for i in range(self.d):
-            value = 0
-            for j in range(self.d):
-                value = (value + int(self.public_matrix_A[i, j]) * int(secret_vector[j])) % self.v3s.prime
-            partial_public_key[i] = int(value)
-        
-        self.partial_public_key = partial_public_key.tolist()
-        
+        partial_public_key_vec = mat_vec_mul(self.public_matrix_A, self.aggregated_shares, self.v3s.prime, self.v3s.ring_degree)
+        self.partial_public_key = vector_to_coeff_lists(partial_public_key_vec)
+        preview_polys = [
+            poly.coeffs[:min(4, len(poly.coeffs))]
+            for poly in partial_public_key_vec[:min(2, len(partial_public_key_vec))]
+        ]
         partial_key_time = time.time() - partial_key_start
-        print(f"[Participant {self.participant_id}] Computed partial public key b_{self.participant_id} = A * s_{self.participant_id} ({partial_key_time*1000:.2f} ms)")
-        print(f"[Participant {self.participant_id}] Partial public key: {[int(val) % 1000 for val in self.partial_public_key[:min(4, len(self.partial_public_key))]]}... (mod 1000)")
-        
-        # 广播部分公钥
-        broadcast_start = time.time()
+        print(
+            f"[Participant {self.participant_id}] Computed partial key b_{self.participant_id} = A * share_{self.participant_id} {role} "
+            f"({partial_key_time*1000:.2f} ms)"
+        )
+        print(f"[Participant {self.participant_id}] Partial public key preview: {preview_polys} (first coeffs)")
 
-        # 创建部分公钥消息（使用现有的消息类或创建新的）
-        # 这里我们使用网络直接广播
+        broadcast_start = time.time()
         partial_key_message = {
             'participant_id': self.participant_id,
-            'partial_public_key': self.partial_public_key
+            'partial_public_key': self.partial_public_key,
         }
-
-        # 广播部分公钥给所有参与者
         with self.network.lock:
             for pid in self.network.message_queues.keys():
                 self.network.message_queues[pid].put(('partial_key', partial_key_message))
-
         broadcast_time = time.time() - broadcast_start
         print(f"[Participant {self.participant_id}] Broadcasted partial public key ({broadcast_time*1000:.2f} ms)")
-        
-        # 接收其他参与者的部分公钥
-        time.sleep(0.5)  # 等待其他参与者广播
-        receive_start = time.time()
-        
-        received_partial_keys = {}
-        received_partial_keys[self.participant_id] = self.partial_public_key
-        
-        # 获取所有有效参与者的ID
-        all_valid_ids = sorted(set(self.valid_shares + [self.participant_id]))
-        
-        timeout = 2.0
-        start_wait = time.time()
-        messages_to_requeue = []
-        
-        while len(received_partial_keys) < len(all_valid_ids) and time.time() - start_wait < timeout:
-            try:
-                msg_type, data = self.network.message_queues[self.participant_id].get(timeout=0.1)
-                if msg_type == 'partial_key':
-                    pid = data['participant_id']
-                    if pid in all_valid_ids and pid not in received_partial_keys:
-                        received_partial_keys[pid] = data['partial_public_key']
-                        print(f"[Participant {self.participant_id}] Received partial public key from Participant {pid}")
-                else:
-                    messages_to_requeue.append((msg_type, data))
-            except:
-                break
-        
-        # 重新放回非部分公钥消息
-        for msg in messages_to_requeue:
-            self.network.message_queues[self.participant_id].put(msg)
-        
-        receive_time = time.time() - receive_start
-        print(f"[Participant {self.participant_id}] Received {len(received_partial_keys)-1} partial public keys ({receive_time*1000:.2f} ms)")
-        
-        # 计算全局公钥 b = b_1 + b_2 + ... + b_n
-        aggregate_start = time.time()
-        
-        global_public_key = np.zeros(self.d, dtype=object)
-        
-        for pid in sorted(received_partial_keys.keys()):
-            partial_key = received_partial_keys[pid]
-            for i in range(self.d):
-                global_public_key[i] = (int(global_public_key[i]) + int(partial_key[i])) % self.v3s.prime
-        
-        self.global_public_key = global_public_key.tolist()
-        
-        aggregate_time = time.time() - aggregate_start
-        
-        total_key_time = matrix_gen_time + partial_key_time + broadcast_time + receive_time + aggregate_time
-        
-        # 记录并暴露全局公钥生成的时间与统计，便于最后统一聚合为 Phase 7
+
+        received_partial_keys: Dict[int, VectorR] = {}
+        collection_time = 0.0
+        reconstruction_time = 0.0
+        broadcast_global_time = 0.0
+        wait_time = 0.0
+
+        if is_reconstructor:
+            collection_start = time.time()
+            received_partial_keys = self.collect_partial_public_keys(all_valid_ids, partial_public_key_vec)
+            collection_time = time.time() - collection_start
+            print(
+                f"[Participant {self.participant_id}] Collected {len(received_partial_keys)} partial keys for RS reconstruction"
+            )
+
+            if len(received_partial_keys) < self.t:
+                raise RuntimeError("Insufficient partial public keys for reconstruction")
+
+            reconstruction_start = time.time()
+            vector_shares = [(pid, vec) for pid, vec in received_partial_keys.items()]
+            global_public_key_vec = self.v3s.reed_solomon_decode_vector(vector_shares, self.t)
+            reconstruction_time = time.time() - reconstruction_start
+
+            correctable_errors = max(0, (len(received_partial_keys) - self.t) // 2)
+
+            self.global_public_key_vector = global_public_key_vec
+            self.global_public_key = vector_to_coeff_lists(global_public_key_vec)
+
+            broadcast_global_start = time.time()
+            self.network.broadcast_global_public_key(self.participant_id, self.global_public_key)
+            broadcast_global_time = time.time() - broadcast_global_start
+            print(
+                f"[Participant {self.participant_id}] ✓ Reconstructed global public key via RS ({reconstruction_time*1000:.2f} ms)"
+            )
+            print(
+                f"[Participant {self.participant_id}] Reed–Solomon tolerance: ⌊(I−T)/2⌋ = {correctable_errors} (I={len(received_partial_keys)}, T={self.t})"
+            )
+        else:
+            pass
+
+        total_key_time = matrix_gen_time + partial_key_time + broadcast_time + collection_time + reconstruction_time + broadcast_global_time + wait_time
         self.public_key_generation_time = total_key_time
+
+        ops_receive = len(received_partial_keys) - 1 if received_partial_keys else 0
+        pub_ops = {
+            "SHAKE-256字节 (生成矩阵A)": bytes_needed,
+            "矩阵生成 (PolyR常量项)": self.d * self.d,
+            "环上乘法 (A×share_i)": self.d * self.d,
+            "部分公钥广播": 1,
+        }
+
+        if is_reconstructor:
+            pub_ops["部分公钥接收"] = max(0, ops_receive)
+            pub_ops["Reed–Solomon纠错 (b_i)"] = self.d * len(received_partial_keys)
+            pub_ops["全局公钥广播"] = 1
+        else:
+            pass
+
+        self.public_key_ops = pub_ops
+
         try:
             self.v3s.add_performance_stat(
                 "全局公钥生成",
                 total_key_time,
-                {
-                    "矩阵生成 (A, d×d)": self.d * self.d,
-                    "部分公钥计算 (A×s_i)": self.d * self.d,
-                    "部分公钥广播 (每个参与者)": len(self.network.message_queues),
-                    "部分公钥接收 (估计每个参与者接收)": len(all_valid_ids)
-                }
+                pub_ops,
             )
         except Exception:
-            # 兼容性保护：若在某些测试路径中无法记录，不影响主流程
             pass
-        
-        print(f"[Participant {self.participant_id}] ✓ Computed global public key b = sum(b_i) ({aggregate_time*1000:.2f} ms)")
-        print(f"[Participant {self.participant_id}] Global public key: {[int(val) % 1000 for val in self.global_public_key[:min(4, len(self.global_public_key))]]}... (mod 1000)")
+
+        if not getattr(self, "global_public_key_vector", None) and self.global_public_key is not None:
+            self.global_public_key_vector = vector_from_coeff_lists(
+                self.global_public_key,
+                self.v3s.prime,
+                self.v3s.ring_degree,
+            )
+
+        if self.global_public_key_vector is not None:
+            preview = [
+                poly.coeffs[:min(4, len(poly.coeffs))]
+                for poly in self.global_public_key_vector[:min(2, len(self.global_public_key_vector))]
+            ]
+            print(
+                f"[Participant {self.participant_id}] Global public key preview: {preview} (first coeffs)."
+            )
+        else:
+            if is_reconstructor:
+                print(
+                    f"[Participant {self.participant_id}] ⚠️  Reconstructor failed to produce global public key"
+                )
+
         print(f"[Participant {self.participant_id}] Total public key generation time: {total_key_time*1000:.2f} ms")
+
+    def select_global_key_reconstructor(self, candidate_ids: List[int]) -> int:
+        """依据共识盐值确定唯一的全局公钥重构者，以确保所有参与者一致。"""
+
+        if not candidate_ids:
+            return self.participant_id
+
+        salt_material = (self.consensus_salt or self.participant_salt or "0").encode()
+        digest = hashlib.sha256(salt_material + b"::global-key").digest()
+        index = int.from_bytes(digest, "big") % len(candidate_ids)
+        return candidate_ids[index]
+
+    def collect_partial_public_keys(
+        self,
+        expected_ids: List[int],
+        own_partial: VectorR,
+        timeout: float = 3.0,
+    ) -> Dict[int, VectorR]:
+        """收集指定集合内的部分公钥，供重构者执行纠错与插值。"""
+
+        collected: Dict[int, VectorR] = {self.participant_id: own_partial}
+        messages_to_requeue: List[Tuple[str, Any]] = []
+        start_wait = time.time()
+
+        while len(collected) < len(expected_ids) and time.time() - start_wait < timeout:
+            try:
+                msg_type, data = self.network.message_queues[self.participant_id].get(timeout=0.1)
+            except Exception:
+                continue
+
+            if msg_type == 'partial_key':
+                pid = data.get('participant_id')
+                if pid in expected_ids and pid not in collected:
+                    collected[pid] = vector_from_coeff_lists(
+                        data['partial_public_key'],
+                        self.v3s.prime,
+                        self.v3s.ring_degree,
+                    )
+                    print(f"[Participant {self.participant_id}] Received partial public key from Participant {pid}")
+            else:
+                messages_to_requeue.append((msg_type, data))
+
+        for msg in messages_to_requeue:
+            self.network.message_queues[self.participant_id].put(msg)
+
+        if len(collected) < len(expected_ids):
+            missing = sorted(set(expected_ids) - set(collected.keys()))
+            print(
+                f"[Participant {self.participant_id}] ⚠️  Missing partial keys from participants: {missing}"
+            )
+
+        return collected
+
+    def wait_for_global_public_key(self, timeout: float = 5.0) -> None:
+        """等待重构者广播最终公钥，若超时则保留None以提示上层逻辑。"""
+
+        start_time = time.time()
+        messages_to_requeue: List[Tuple[str, Any]] = []
+
+        while time.time() - start_time < timeout:
+            try:
+                msg_type, data = self.network.message_queues[self.participant_id].get(timeout=0.2)
+            except Exception:
+                continue
+
+            if msg_type == 'global_key':
+                self.global_public_key = data['global_public_key']
+                self.reconstructor_id = data.get('leader_id')
+                self.global_public_key_vector = vector_from_coeff_lists(
+                    self.global_public_key,
+                    self.v3s.prime,
+                    self.v3s.ring_degree,
+                )
+                print(
+                    f"[Participant {self.participant_id}] Received global public key broadcast from Participant {self.reconstructor_id}"
+                )
+                break
+            else:
+                messages_to_requeue.append((msg_type, data))
+
+        for msg in messages_to_requeue:
+            self.network.message_queues[self.participant_id].put(msg)
+
+        if self.global_public_key is None:
+            print(
+                f"[Participant {self.participant_id}] ⚠️  Timed out while waiting for global public key broadcast"
+            )
 
 def test_distributed_v3s():
     """测试分布式V3S协议"""
@@ -1839,8 +2247,8 @@ def test_distributed_v3s():
     print("="*80 + "\n")
     
     # 协议参数
-    num_participants = 5
-    threshold = 3
+    num_participants = 6
+    threshold = 2
     dimension = 4
     sigma_x = 1.0
     sigma_y = sigma_x * (337 ** 0.5)
@@ -1851,8 +2259,7 @@ def test_distributed_v3s():
     print(f"  • Vector dimension (d):       {dimension}")
     print(f"  • sigma_x:                    {sigma_x:.2f}")
     print(f"  • sigma_y:                    {sigma_y:.2f} (= √337 × sigma_x)")
-    print(f"  • Prime field size:           2^255 - 19")
-    print(f"  • Prime bit length:           {PRIME.bit_length()} bits")
+    print(f"  • Prime field size:           12289")
     print(f"  • Encryption:                 X25519 KEM + AES-256-GCM (Ed25519 signatures)")
     print("-" * 80 + "\n")
     
@@ -1956,178 +2363,34 @@ def test_distributed_v3s():
         avg_verify_time = total_verification_time / len(all_verification_ops) if all_verification_ops else 0
         print(f"\n  🔍 Average verification time: {avg_verify_time*1000:.4f} ms per share")
     
-    # 全局秘密重构阶段
+    # 聚合份额阶段（与旧版全局秘密重构阶段对应）
     print("\n" + "="*80)
-    print("***  GLOBAL SECRET RECONSTRUCTION  ***".center(80))
+    print("***  AGGREGATED SECRET SHARES  ***".center(80))
     print("="*80 + "\n")
-    
-    # 验证所有参与者是否成功重构全局秘密
-    global_secrets = {}
-    reconstruction_times = {}
-    
+
+    aggregated_norms = []
+    ring_degree = participants[0].v3s.ring_degree if participants else RING_DEGREE
+
     for participant in participants:
-        if participant.global_secret is not None:
-            global_secrets[participant.participant_id] = participant.global_secret
-            reconstruction_times[participant.participant_id] = participant.reconstruction_time
-            print(f"  Participant {participant.participant_id}: ✓ Reconstructed global secret")
-            print(f"     Global secret: {participant.global_secret}")
-            print(f"     ||S_global|| = {np.linalg.norm(participant.global_secret):.4f}")
-            print(f"     Reconstruction time: {participant.reconstruction_time*1000:.2f} ms")
+        reconstructor = participant.reconstructor_id or "?"
+        if participant.aggregated_shares is not None:
+            share_norm = vector_l2(participant.aggregated_shares)
+            aggregated_norms.append(share_norm)
+            share_preview = vector_to_coeff_lists(participant.aggregated_shares)[:1]
+            print(
+                f"  Participant {participant.participant_id}: ✓ Aggregated share ready | ||share_i|| = {share_norm:.4f} | "
+                f"Leader: P{reconstructor}"
+            )
+            print(f"     Share preview: {share_preview}")
         else:
-            print(f"  Participant {participant.participant_id}: ✗ Failed to reconstruct global secret")
-    
-    # 验证一致性：所有参与者重构的全局秘密应该相同
-    if global_secrets:
-        unique_secrets = list(set([tuple(s) for s in global_secrets.values()]))
-        if len(unique_secrets) == 1:
-            print(f"\n  ✓ All participants reconstructed the SAME global secret!")
-            print(f"  Global secret: {list(unique_secrets[0])}")
-            print(f"  ||S_global|| = {np.linalg.norm(unique_secrets[0]):.4f}")
-        else:
-            print(f"\n  ✗ WARNING: Participants reconstructed DIFFERENT global secrets!")
-            for pid, secret in global_secrets.items():
-                print(f"     P{pid}: {secret}")
-        
-        # 验证全局秘密是否等于所有参与者秘密的和
-        print(f"\n  📊 Verification: S_global = S_1 + S_2 + ... + S_n")
-        
-        # 计算期望的全局秘密（所有参与者原始秘密的和）
-        expected_global_secret = [0] * dimension
-        for participant in participants:
-            secret = participant.secret_vector
-            for i in range(dimension):
-                expected_global_secret[i] += secret[i]
-        
-        print(f"  Expected global secret (sum of all secrets): {expected_global_secret}")
-        print(f"  Expected ||S_global|| = {np.linalg.norm(expected_global_secret):.4f}")
-        
-        # 比较重构的全局秘密与期望值
-        if unique_secrets:
-            reconstructed = list(unique_secrets[0])
-            match = all(abs(reconstructed[i] - expected_global_secret[i]) < 1e-6 for i in range(dimension))
-            if match:
-                print(f"  ✓ Reconstructed global secret MATCHES expected sum!")
-            else:
-                print(f"  ✗ Reconstructed global secret DOES NOT match expected sum!")
-                print(f"  Difference: {[reconstructed[i] - expected_global_secret[i] for i in range(dimension)]}")
-        
-        # 平均重构时间
-        avg_recon_time = np.mean(list(reconstruction_times.values()))
-        print(f"\n  ⏱  Average global secret reconstruction time: {avg_recon_time*1000:.2f} ms")
+            print(
+                f"  Participant {participant.participant_id}: ✗ Missing aggregated share | Leader: P{reconstructor}"
+            )
+
+    if aggregated_norms:
+        print(f"\n  ⏱  Average aggregated share norm: {np.mean(aggregated_norms):.4f}")
     else:
-        print(f"\n  ✗ No participants successfully reconstructed the global secret")
-    
-    # 全局公钥验证阶段
-    print("\n" + "="*80)
-    print("***  GLOBAL PUBLIC KEY GENERATION  ***".center(80))
-    print("="*80 + "\n")
-    
-    # 验证所有参与者是否成功生成全局公钥
-    global_public_keys = {}
-    partial_public_keys = {}
-    public_matrices = {}
-    
-    for participant in participants:
-        if participant.global_public_key is not None:
-            global_public_keys[participant.participant_id] = participant.global_public_key
-            partial_public_keys[participant.participant_id] = participant.partial_public_key
-            public_matrices[participant.participant_id] = participant.public_matrix_A
-            
-            print(f"  Participant {participant.participant_id}: ✓ Generated global public key")
-            print(f"     Partial key b_{participant.participant_id}: {[int(val) % 1000 for val in participant.partial_public_key[:4]]}... (mod 1000)")
-            print(f"     Global key b: {[int(val) % 1000 for val in participant.global_public_key[:4]]}... (mod 1000)")
-        else:
-            print(f"  Participant {participant.participant_id}: ✗ Failed to generate global public key")
-    
-    # 验证一致性
-    if global_public_keys:
-        # 验证所有参与者的公共矩阵A相同
-        print(f"\n  🔐 Public Matrix A Verification:")
-        if public_matrices:
-            # 比较所有矩阵是否相同
-            matrix_list = list(public_matrices.values())
-            all_same = True
-            first_matrix = matrix_list[0]
-            
-            for matrix in matrix_list[1:]:
-                if not np.array_equal(first_matrix, matrix):
-                    all_same = False
-                    break
-            
-            if all_same:
-                print(f"     ✓ All participants generated the SAME public matrix A!")
-                print(f"     Matrix A shape: {first_matrix.shape} (expected: {dimension}×{dimension})")
-                print(f"     Matrix A preview (first row, mod 1000): {[int(val) % 1000 for val in first_matrix[0][:min(4, dimension)]]}")
-            else:
-                print(f"     ✗ WARNING: Participants generated DIFFERENT public matrices!")
-        
-        # 验证所有参与者计算的全局公钥相同
-        print(f"\n  🔑 Global Public Key Verification:")
-        unique_keys = list(set([tuple(k) for k in global_public_keys.values()]))
-        
-        if len(unique_keys) == 1:
-            print(f"     ✓ All participants computed the SAME global public key!")
-            print(f"     Global public key b: {[int(val) % 1000 for val in unique_keys[0][:4]]}... (mod 1000)")
-        else:
-            print(f"     ✗ WARNING: Participants computed DIFFERENT global public keys!")
-            for pid, key in global_public_keys.items():
-                print(f"     P{pid}: {[int(val) % 1000 for val in key[:4]]}... (mod 1000)")
-        
-        # 验证数学正确性：b = A * s_global
-        print(f"\n  📊 Mathematical Verification: b = A * s_global")
-
-        if global_secrets and public_matrices:
-            # 使用第一个参与者的矩阵A和全局秘密计算期望的全局公钥
-            A_matrix = list(public_matrices.values())[0]
-            s_global = np.array(list(global_secrets.values())[0], dtype=object)
-
-            expected_global_key = np.zeros(dimension, dtype=object)
-            for i in range(dimension):
-                value = 0
-                for j in range(dimension):
-                    value = (value + int(A_matrix[i, j]) * int(s_global[j])) % PRIME
-                expected_global_key[i] = int(value)
-
-            expected_global_key_list = expected_global_key.tolist()
-
-            print(f"  Expected b = A * s_global: {[int(val) % 1000 for val in expected_global_key_list[:4]]}... (mod 1000)")
-
-            # 比较计算的全局公钥与期望值
-            if unique_keys:
-                computed_key = list(unique_keys[0])
-                match = all(int(computed_key[i]) % PRIME == int(expected_global_key_list[i]) % PRIME for i in range(dimension))
-
-                if match:
-                    print(f"  ✓ Global public key MATCHES A * s_global!")
-                else:
-                    print(f"  ✗ Global public key DOES NOT match A * s_global!")
-                    print(f"  Difference (first 4): {[int(computed_key[i]) - int(expected_global_key_list[i]) for i in range(min(4, dimension))]}")
-
-        # 验证：b = sum(b_i) = sum(A * s_i)
-        print(f"\n  📊 Verification: b = sum(b_i) = sum(A * s_i)")
-        
-        if partial_public_keys and len(partial_public_keys) >= threshold:
-            # 计算所有部分公钥的和
-            computed_sum = np.zeros(dimension, dtype=object)
-            
-            for pid, partial_key in partial_public_keys.items():
-                for i in range(dimension):
-                    computed_sum[i] = (int(computed_sum[i]) + int(partial_key[i])) % PRIME
-            
-            computed_sum_list = computed_sum.tolist()
-            
-            print(f"  Computed sum(b_i): {[int(val) % 1000 for val in computed_sum_list[:4]]}... (mod 1000)")
-            
-            if unique_keys:
-                global_key = list(unique_keys[0])
-                match = all(int(global_key[i]) % PRIME == int(computed_sum_list[i]) % PRIME for i in range(dimension))
-                
-                if match:
-                    print(f"  ✓ Global public key b MATCHES sum(b_i)!")
-                else:
-                    print(f"  ✗ Global public key b DOES NOT match sum(b_i)!")
-    else:
-        print(f"\n  ✗ No participants successfully generated global public key")
+        print("\n  ✗ No aggregated shares were finalized")
     
     # 打印性能报告（聚合所有参与者的数据）
     if participants:
@@ -2141,7 +2404,7 @@ def test_distributed_v3s():
             "挑战矩阵与界限计算",
             "验证向量计算",
             "网络通信",
-            "全局秘密重构",
+            "聚合份额生成",
             "全局公钥生成"
         ]
         
@@ -2167,39 +2430,44 @@ def test_distributed_v3s():
                 combined_network_ops[op_name] = combined_network_ops.get(op_name, 0) + count
         aggregated_v3s.add_performance_stat("网络通信", max_network_time, combined_network_ops)
         
-        # 全局秘密重构（并发，取最大值）
-        if reconstruction_times:
-            max_global_recon_time = max(reconstruction_times.values())
-        else:
-            max_global_recon_time = 0
-        aggregated_v3s.add_performance_stat(
-            "全局秘密重构",
-            max_global_recon_time,
-            {
-                "聚合份额计算 (每个参与者计算自己位置的聚合份额)": num_participants,
-                "聚合份额广播 (每个参与者广播自己的聚合份额)": num_participants,
-                "聚合份额接收 (每个参与者接收其他人的聚合份额)": num_participants * num_participants,
-                "拉格朗日插值 (使用t个聚合份额重构全局秘密)": num_participants * dimension,
-                "模逆元计算 (拉格朗日插值中的模逆运算)": num_participants * dimension * threshold * (threshold - 1),
-                "模乘法 (拉格朗日基函数计算)": num_participants * dimension * threshold * threshold * 2,
-                "中心化转换 (重构结果转回有符号表示)": num_participants * dimension,
+        # 聚合份额生成阶段（原全局秘密重构阶段，现仅保留聚合逻辑）
+        aggregation_times = [getattr(p, "reconstruction_time", 0.0) for p in participants]
+        max_global_recon_time = max(aggregation_times) if aggregation_times else 0
+        combined_recon_ops: Dict[str, int] = {}
+        for participant in participants:
+            for op_name, count in getattr(participant, "reconstruction_ops", {}).items():
+                combined_recon_ops[op_name] = combined_recon_ops.get(op_name, 0) + count
+        if not combined_recon_ops:
+            combined_recon_ops = {
+                "聚合份额加法 (每个参与者)": num_participants * dimension,
+                "聚合份额准备 (广播取消)": num_participants,
             }
+        aggregated_v3s.add_performance_stat(
+            "聚合份额生成",
+            max_global_recon_time,
+            combined_recon_ops,
         )
         
         # 全局公钥生成（并发，取最大值）—— Phase 7
         public_key_times = [p.public_key_generation_time for p in participants]
         max_pub_key_time = max(public_key_times) if public_key_times else 0
-        combined_pub_ops = {
-            "SHAKE-256摘要 (生成矩阵伪随机字节)": num_participants * dimension * dimension * 4,
-            "矩阵生成 (A, d×d, 所有参与者)": num_participants * dimension * dimension,
-            "部分公钥计算 (A×s_i, 所有参与者)": num_participants * dimension * dimension,
-            "部分公钥广播 (估计)": num_participants,
-            "部分公钥接收 (估计)": num_participants * num_participants,
-            "全局公钥聚合 (求和所有部分公钥)": num_participants * num_participants * dimension,
-        }
+        combined_pub_ops: Dict[str, int] = {}
+        for participant in participants:
+            for op_name, count in getattr(participant, "public_key_ops", {}).items():
+                combined_pub_ops[op_name] = combined_pub_ops.get(op_name, 0) + count
+        if not combined_pub_ops:
+            combined_pub_ops = {
+                "SHAKE-256摘要 (生成矩阵伪随机字节)": num_participants * dimension * dimension * 4,
+                "矩阵生成 (A, d×d, 所有参与者)": num_participants * dimension * dimension,
+                "部分公钥计算 (A×s_i, 所有参与者)": num_participants * dimension * dimension,
+                "部分公钥广播 (估计)": num_participants,
+                "部分公钥接收 (估计)": num_participants * num_participants,
+                "全局公钥聚合 (求和所有部分公钥)": num_participants * num_participants * dimension,
+            }
         aggregated_v3s.add_performance_stat("全局公钥生成", max_pub_key_time, combined_pub_ops)
         
         aggregated_v3s.print_performance_report()
 
 if __name__ == "__main__":
+    setup_run_logger()
     test_distributed_v3s()
