@@ -936,49 +936,63 @@ class V3S:
                 for participant_index, vector in enumerate(v_shares)
             ]
 
-            reconstructed = self.reconstruct_poly_from_shares(shares_for_coord)
+            reconstructed = self.reconstruct_ring_from_shares(shares_for_coord, self.t)
             aggregated.append(reconstructed)
 
         return aggregated
 
-    def shamir_share(self, secret: int, n: int, t: int) -> List[Share]:
-        """在 GF(prime) 中为标量 secret 生成 n 份 t 阶 Shamir 份额。"""
-        coefficients = [secret % self.prime] + [self.rng.randbelow(self.prime) for _ in range(t-1)]
-        
-        shares = []
-        for i in range(1, n+1):
-            value = 0
+    def _random_uniform_poly(self) -> PolyR:
+        """采样均匀分布的环元素，作为 Shamir 多项式的随机系数。"""
+        coeffs = [self.rng.randbelow(self.prime) for _ in range(self.ring_degree)]
+        return PolyR(coeffs, self.prime, self.ring_degree)
+
+    def shamir_share_ring(self, secret: PolyR, n: int, t: int) -> List[Share]:
+        """对 R_q 元素执行环级 Shamir Secret Sharing。"""
+        if t < 1 or n < t:
+            raise ValueError("Invalid Shamir parameters for ring sharing")
+
+        coefficients: List[PolyR] = [secret.copy()]
+        for _ in range(t - 1):
+            coefficients.append(self._random_uniform_poly())
+
+        shares: List[Share] = []
+        for participant in range(1, n + 1):
+            share_value = PolyR.zero(self.prime, self.ring_degree)
             for power, coeff in enumerate(coefficients):
-                value = (value + coeff * pow(i, power, self.prime)) % self.prime
-            shares.append(Share(value, i))
+                scalar = pow(participant, power, self.prime)
+                share_value = share_value + (scalar * coeff)
+            shares.append(Share(share_value, participant))
         return shares
 
-    def shamir_share_poly(self, secret: PolyR, n: int, t: int) -> List[Share]:
-        """逐系数应用 Shamir 共享，将 PolyR 秘密拆分成 n 份多项式份额。"""
-        coeff_shares: List[List[Share]] = []
-        for coeff in secret.coeffs:
-            coeff_shares.append(self.shamir_share(coeff, n, t))
+    def reconstruct_ring_from_shares(self, shares: List[Share], threshold: int) -> PolyR:
+        """在 R_q 上执行拉格朗日插值，直接重构环元素。"""
+        if len(shares) < threshold:
+            raise ValueError("Insufficient shares for ring reconstruction")
 
-        poly_shares: List[Share] = []
-        for participant in range(n):
-            participant_coeffs = [coeff_shares[idx][participant].value for idx in range(secret.degree)]
-            poly_value = poly_from_coeffs(participant_coeffs, self.prime, self.ring_degree)
-            poly_shares.append(Share(poly_value, participant + 1))
-        return poly_shares
+        selected = shares[:]  # 使用全部可用份额，至少年数满足阈值
+        modulus = self.prime
+        secret = PolyR.zero(modulus, self.ring_degree)
 
-    def reconstruct_poly_from_shares(self, shares: List[Share]) -> PolyR:
-        """从多项式份额列表中逐系数插值，恢复原始 PolyR。"""
-        if not shares:
-            raise ValueError("No shares provided for reconstruction")
-        degree = shares[0].value.degree if isinstance(shares[0].value, PolyR) else self.ring_degree
-        coeffs: List[int] = []
-        for coeff_idx in range(degree):
-            scalar_shares = [
-                Share(int(share.value.coeffs[coeff_idx]), share.index)
-                for share in shares
-            ]
-            coeffs.append(self.lagrange_interpolate(scalar_shares))
-        return poly_from_coeffs(coeffs, self.prime, degree)
+        for idx, share in enumerate(selected):
+            share_index = share.index % modulus
+            if share_index == 0:
+                raise ValueError("Share index must be non-zero modulo prime")
+
+            lagrange_coeff = 1
+            for other_idx, other_share in enumerate(selected):
+                if idx == other_idx:
+                    continue
+                other_index = other_share.index % modulus
+                lagrange_coeff = (lagrange_coeff * other_index) % modulus
+                denom = (other_index - share_index) % modulus
+                if denom == 0:
+                    raise ValueError("Duplicate share indices detected")
+                inv = pow(denom, modulus - 2, modulus)
+                lagrange_coeff = (lagrange_coeff * inv) % modulus
+
+            secret = secret + (lagrange_coeff * share.value)
+
+        return secret
 
     def reed_solomon_decode_scalar(self, shares: List[Share], threshold: int) -> int:
         """使用Berlekamp–Welch思想对标量份额执行Reed–Solomon纠错，并返回f(0)。"""
@@ -1099,10 +1113,10 @@ class V3S:
         ]
         step1_time = time.time() - start_time
 
-        # Step 2: coefficient-wise Shamir sharing for each PolyR
+        # Step 2: Ring-level Shamir sharing for each PolyR
         start_time = time.time()
-        x_shares = [self.shamir_share_poly(secret_vector[i], self.n, self.t) for i in range(d)]
-        y_shares = [self.shamir_share_poly(y_vector[i], self.n, self.t) for i in range(d)]
+        x_shares = [self.shamir_share_ring(secret_vector[i], self.n, self.t) for i in range(d)]
+        y_shares = [self.shamir_share_ring(y_vector[i], self.n, self.t) for i in range(d)]
         step2_time = time.time() - start_time
         phase1_duration = step1_time + step2_time
         self.add_performance_stat(
@@ -1110,8 +1124,8 @@ class V3S:
             phase1_duration,
             {
                 "Gaussian采样 (多项式噪声)": d * self.ring_degree,
-                "多项式份额生成 (x,y)": 2 * d * self.n,
-                "系数级拉格朗日系数": 2 * d * self.n * self.t * self.ring_degree,
+                "环级多项式份额生成 (x,y)": 2 * d * self.n,
+                "Shamir多项式评估 (R_q)": 2 * d * self.n * self.t,
             },
         )
 
@@ -2396,6 +2410,54 @@ def test_distributed_v3s():
         print(f"\n  ⏱  Average aggregated share norm: {np.mean(aggregated_norms):.4f}")
     else:
         print("\n  ✗ No aggregated shares were finalized")
+
+    # 全局公钥阶段汇总
+    print("\n" + "="*80)
+    print("***  GLOBAL PUBLIC KEY GENERATION  ***".center(80))
+    print("="*80 + "\n")
+
+    public_matrices: Dict[int, MatrixR] = {}
+    leaders_with_keys: List[DistributedParticipant] = []
+
+    for participant in participants:
+        pid = participant.participant_id
+        reconstructor = participant.reconstructor_id or "?"
+        has_matrix = participant.public_matrix_A is not None
+        has_partial = participant.partial_public_key is not None
+        leader_tag = ""
+        if participant.reconstructor_id == pid and participant.global_public_key is not None:
+            leader_tag = " (global key reconstructor)"
+
+        matrix_status = "✓" if has_matrix else "✗"
+        partial_status = "✓" if has_partial else "✗"
+        print(
+            f"  Participant {pid}: {matrix_status} Public matrix | {partial_status} Partial key | Leader: P{reconstructor}{leader_tag}"
+        )
+
+        if has_matrix:
+            public_matrices[pid] = participant.public_matrix_A
+            first_row = participant.public_matrix_A[0] if participant.public_matrix_A else []
+            row_preview = [poly.coeffs[:2] for poly in first_row[:min(2, len(first_row))]] if first_row else []
+            print(f"     Matrix A first row preview: {row_preview}")
+
+        if has_partial and participant.partial_public_key:
+            partial_preview = [poly[:4] for poly in participant.partial_public_key[:1]]
+            print(f"     Partial key preview: {partial_preview}")
+
+        if participant.global_public_key is not None:
+            leaders_with_keys.append(participant)
+            global_preview = [poly[:4] for poly in participant.global_public_key[:1]]
+            print(f"     Global key preview: {global_preview}")
+
+    print(f"\n  🔑 Global Public Key Broadcast:")
+    if leaders_with_keys:
+        for leader in leaders_with_keys:
+            preview = [poly[:4] for poly in leader.global_public_key[:1]] if leader.global_public_key else []
+            print(
+                f"     • Leader P{leader.participant_id} reconstructed global key | Preview: {preview}"
+            )
+    else:
+        print("     ✗ No participant reported a reconstructed global public key")
     
     # 打印性能报告（聚合所有参与者的数据）
     if participants:
