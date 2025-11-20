@@ -2252,14 +2252,19 @@ def test_distributed_v3s():
     dimension = 4
     sigma_x = 1.0
     sigma_y = sigma_x * (337 ** 0.5)
+    ring_degree = RING_DEGREE
+    prime_modulus = PRIME
     
     print("*** Protocol Parameters ***")
     print(f"  • Number of participants (N): {num_participants}")
     print(f"  • Threshold (T):              {threshold}")
-    print(f"  • Vector dimension (d):       {dimension}")
     print(f"  • sigma_x:                    {sigma_x:.2f}")
     print(f"  • sigma_y:                    {sigma_y:.2f} (= √337 × sigma_x)")
-    print(f"  • Prime field size:           12289")
+    print(f"  • Algebraic setting:          Module lattice R_q^k")
+    print(f"       – Base ring R_q:         ℤ_q[X]/(X^{ring_degree}+1)")
+    print(f"       – Modulus q:             {prime_modulus}")
+    print(f"       – Ring dimension n:      {ring_degree}")
+    print(f"       – Module rank k (d):     {dimension}")
     print(f"  • Encryption:                 X25519 KEM + AES-256-GCM (Ed25519 signatures)")
     print("-" * 80 + "\n")
     
