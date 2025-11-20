@@ -10,4 +10,4 @@
 
 
 ## 运行说明
-* 在项目根目录，运行 python3 V3S_distributed.py
+* 在项目根目录，运行 python3 V3S_DKG.py
