@@ -3,7 +3,7 @@
 
 
 
-## 相关参数（也是与论文的主要区别，没有严格按照论文选取参数实现安全规约）
+## 相关参数
 * Number of participants (N): 6
 * Threshold (T):              2
 * sigma_x:                    1.00
@@ -22,6 +22,7 @@
 ## 运行条件
 * Python 3.10.12 及以上
 * 安装所有导入的包
+* 在项目根目录克隆铜锁项目：https://github.com/Tongsuo-Project/Tongsuo.git，并编译安装
 
 
 
