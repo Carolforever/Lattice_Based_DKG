@@ -3,19 +3,19 @@
 
 
 
-*** 相关参数（也是与论文的主要区别，没有严格按照论文选取参数实现安全规约） ***
-  • Number of participants (N): 6
-  • Threshold (T):              2
-  • sigma_x:                    1.00
-  • sigma_y:                    18.36 (= √337 × sigma_x)
-  • slack_factor：              10.0
-  • Algebraic setting:          Module lattice R_q^k
-       – Base ring R_q:         ℤ_q[X]/(X^8+1)
-       – Modulus q:             12289
-       – Ring dimension n:      8
-       – Module rank k (d):     4
-  • bound：                     slack_factor * σ_v * sqrt(d * ring_degree)
-  • Encryption:                 X25519 KEM + AES-256-GCM (Ed25519 signatures)
+## 相关参数（也是与论文的主要区别，没有严格按照论文选取参数实现安全规约）
+* Number of participants (N): 6
+* Threshold (T):              2
+* sigma_x:                    1.00
+* sigma_y:                    18.36 (= √337 × sigma_x)
+* slack_factor：              10.0
+* Algebraic setting:          Module lattice R_q^k
+   * – Base ring R_q:         ℤ_q[X]/(X^8+1)
+   * – Modulus q:             12289
+   * – Ring dimension n:      8
+   * – Module rank k (d):     4
+* bound：                     slack_factor * σ_v * sqrt(d * ring_degree)
+* Encryption:                 X25519 KEM + AES-256-GCM (Ed25519 signatures)
 
 
 
