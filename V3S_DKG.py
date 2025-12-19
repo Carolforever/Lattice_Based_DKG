@@ -144,34 +144,6 @@ def _get_ntt_roots(modulus: int, size: int) -> Tuple[int, int]:
     raise ValueError("Unable to find primitive root for NTT")
 
 
-def _ntt_inplace(vec: List[int], modulus: int, root: int) -> None:
-    """原地执行Cooley–Tukey NTT 或 INTT（传入对应根）。"""
-    n = len(vec)
-    j = 0
-    for i in range(1, n):
-        bit = n >> 1
-        while j & bit:
-            j ^= bit
-            bit >>= 1
-        j ^= bit
-        if i < j:
-            vec[i], vec[j] = vec[j], vec[i]
-
-    length = 2
-    while length <= n:
-        step = pow(root, n // length, modulus)
-        for start in range(0, n, length):
-            w = 1
-            half = length // 2
-            for idx in range(start, start + half):
-                u = vec[idx]
-                v = (vec[idx + half] * w) % modulus
-                vec[idx] = (u + v) % modulus
-                vec[idx + half] = (u - v) % modulus
-                w = (w * step) % modulus
-        length <<= 1
-
-
 def _bit_reverse_indices(size: int) -> np.ndarray:
     """生成给定长度的位反序索引（NumPy 版本）。"""
     bits = (size - 1).bit_length()
@@ -215,35 +187,18 @@ def _negacyclic_ntt_convolution(
         conv_len <<= 1
 
     root, inv_root = _get_ntt_roots(modulus, conv_len)
-    use_numpy = np is not None
-    if not use_numpy:
-        a_pad = list(a) + [0] * (conv_len - degree)
-        b_pad = list(b) + [0] * (conv_len - degree)
-    else:
-        a_pad = np.zeros(conv_len, dtype=np.int64)
-        b_pad = np.zeros(conv_len, dtype=np.int64)
-        a_pad[:degree] = a
-        b_pad[:degree] = b
+    a_pad = np.zeros(conv_len, dtype=np.int64)
+    b_pad = np.zeros(conv_len, dtype=np.int64)
+    a_pad[:degree] = a
+    b_pad[:degree] = b
 
-    if use_numpy:
-        _ntt_inplace_numpy(a_pad, modulus, root)
-        _ntt_inplace_numpy(b_pad, modulus, root)
-        a_pad = (a_pad * b_pad) % modulus
-        _ntt_inplace_numpy(a_pad, modulus, inv_root)
-        inv_len = pow(conv_len, modulus - 2, modulus)
-        a_pad = (a_pad * inv_len) % modulus
-        coeff_source = a_pad.tolist()
-    else:
-        _ntt_inplace(a_pad, modulus, root)
-        _ntt_inplace(b_pad, modulus, root)
-        for idx in range(conv_len):
-            a_pad[idx] = (a_pad[idx] * b_pad[idx]) % modulus
-
-        _ntt_inplace(a_pad, modulus, inv_root)
-        inv_len = pow(conv_len, modulus - 2, modulus)
-        for idx in range(conv_len):
-            a_pad[idx] = (a_pad[idx] * inv_len) % modulus
-        coeff_source = a_pad
+    _ntt_inplace_numpy(a_pad, modulus, root)
+    _ntt_inplace_numpy(b_pad, modulus, root)
+    a_pad = (a_pad * b_pad) % modulus
+    _ntt_inplace_numpy(a_pad, modulus, inv_root)
+    inv_len = pow(conv_len, modulus - 2, modulus)
+    a_pad = (a_pad * inv_len) % modulus
+    coeff_source = a_pad.tolist()
 
     result = coeff_source[:degree]
     for idx in range(degree, min(2 * degree, conv_len)):
