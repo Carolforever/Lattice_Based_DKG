@@ -22,7 +22,7 @@
 ## 运行条件
 * Python 3.10.12 及以上
 * 安装所有导入的包
-* 在项目根目录克隆铜锁项目：https://github.com/Tongsuo-Project/Tongsuo.git，并编译安装
+* 在项目根目录克隆铜锁项目并编译安装：https://github.com/Tongsuo-Project/Tongsuo.git
 
 
 
