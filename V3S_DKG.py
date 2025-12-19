@@ -6,16 +6,12 @@ import json
 import math
 import time
 import threading
+import asyncio
+import pickle
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 from dataclasses import dataclass, field
 from queue import Queue
 import numpy as np
-from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ed25519, x25519
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from cryptography.hazmat.backends import default_backend
 import os
 import sys
 import datetime
@@ -23,6 +19,28 @@ from pathlib import Path
 import atexit
 
 from secure_rng import SecureRandom
+
+TONGSUO_LOAD_ERROR: Optional[Exception] = None
+AESCIPHER_SOURCE = ""
+try:
+    from tongsuo import (
+        TongsuoAESGCM as AESGCMImpl,
+        Ed25519PrivateKey,
+        Ed25519PublicKey,
+        X25519PrivateKey,
+        X25519PublicKey,
+        hkdf_sha256,
+        InvalidSignature,
+        LIBCRYPTO_PATH,
+    )
+
+    AES_BACKEND = "tongsuo"
+    AESCIPHER_SOURCE = LIBCRYPTO_PATH
+except Exception as exc:  # noqa: BLE001 - 显式要求依赖 Tongsuo
+    TONGSUO_LOAD_ERROR = exc
+    raise RuntimeError(
+        "无法加载 Tongsuo 提供的密码学原语，请先构建 libcrypto 并设置 TONGSUO_LIBCRYPTO_PATH"
+    ) from exc
 
 PRIME = 12289
 RING_DEGREE = 8  # degree n of X^n + 1
@@ -65,6 +83,198 @@ def _center(value: int, modulus: int) -> int:
     if value > half:
         value -= modulus
     return value
+
+
+_NTT_ROOT_CACHE: Dict[Tuple[int, int], Tuple[int, int]] = {}
+_NTT_FACTOR_CACHE: Dict[int, Set[int]] = {}
+_NTT_NAIVE_THRESHOLD = 32
+
+
+def _prime_factors(n: int) -> Set[int]:
+    """返回整数 n 的素因子集合，结果会被缓存复用。"""
+    if n in _NTT_FACTOR_CACHE:
+        return _NTT_FACTOR_CACHE[n]
+
+    factors: Set[int] = set()
+    remaining = n
+    divisor = 2
+    while divisor * divisor <= remaining:
+        if remaining % divisor == 0:
+            factors.add(divisor)
+            while remaining % divisor == 0:
+                remaining //= divisor
+        divisor = 3 if divisor == 2 else divisor + 2
+    if remaining > 1:
+        factors.add(remaining)
+
+    _NTT_FACTOR_CACHE[n] = factors
+    return factors
+
+
+def _get_ntt_roots(modulus: int, size: int) -> Tuple[int, int]:
+    """获取给定模数与长度的原始根及其逆元（NTT）."""
+    if size <= 1:
+        raise ValueError("NTT size must be greater than 1")
+    if (modulus - 1) % size != 0:
+        raise ValueError("Modulus does not support requested NTT size")
+    if size & (size - 1):
+        raise ValueError("NTT size must be a power of two")
+
+    cache_key = (modulus, size)
+    if cache_key in _NTT_ROOT_CACHE:
+        return _NTT_ROOT_CACHE[cache_key]
+
+    order_factors = _prime_factors(size)
+    exponent = (modulus - 1) // size
+
+    for candidate in range(2, modulus):
+        root = pow(candidate, exponent, modulus)
+        if root == 1:
+            continue
+        is_primitive = True
+        for factor in order_factors:
+            if pow(root, size // factor, modulus) == 1:
+                is_primitive = False
+                break
+        if is_primitive:
+            inv_root = pow(root, modulus - 2, modulus)
+            _NTT_ROOT_CACHE[cache_key] = (root, inv_root)
+            return root, inv_root
+
+    raise ValueError("Unable to find primitive root for NTT")
+
+
+def _ntt_inplace(vec: List[int], modulus: int, root: int) -> None:
+    """原地执行Cooley–Tukey NTT 或 INTT（传入对应根）。"""
+    n = len(vec)
+    j = 0
+    for i in range(1, n):
+        bit = n >> 1
+        while j & bit:
+            j ^= bit
+            bit >>= 1
+        j ^= bit
+        if i < j:
+            vec[i], vec[j] = vec[j], vec[i]
+
+    length = 2
+    while length <= n:
+        step = pow(root, n // length, modulus)
+        for start in range(0, n, length):
+            w = 1
+            half = length // 2
+            for idx in range(start, start + half):
+                u = vec[idx]
+                v = (vec[idx + half] * w) % modulus
+                vec[idx] = (u + v) % modulus
+                vec[idx + half] = (u - v) % modulus
+                w = (w * step) % modulus
+        length <<= 1
+
+
+def _bit_reverse_indices(size: int) -> np.ndarray:
+    """生成给定长度的位反序索引（NumPy 版本）。"""
+    bits = (size - 1).bit_length()
+    indices = np.arange(size, dtype=np.uint32)
+    reversed_indices = np.zeros(size, dtype=np.uint32)
+    for bit in range(bits):
+        reversed_indices |= ((indices >> bit) & 1) << (bits - 1 - bit)
+    return reversed_indices
+
+
+def _ntt_inplace_numpy(vec: np.ndarray, modulus: int, root: int) -> None:
+    """使用 NumPy 加速的原地 NTT/INTT 实现。"""
+    n = vec.size
+    bit_reversed = _bit_reverse_indices(n)
+    vec[:] = vec[bit_reversed]
+
+    length = 2
+    while length <= n:
+        half = length // 2
+        step = pow(root, n // length, modulus)
+        w_pows = np.array([pow(step, k, modulus) for k in range(half)], dtype=np.int64)
+        blocks = vec.reshape(-1, length)
+        left = blocks[:, :half].copy()
+        right = blocks[:, half:]
+        right = (right * w_pows) % modulus
+        blocks[:, :half] = (left + right) % modulus
+        blocks[:, half:] = (left - right) % modulus
+        length <<= 1
+
+
+def _negacyclic_ntt_convolution(
+    a: Sequence[int],
+    b: Sequence[int],
+    modulus: int,
+    degree: int,
+) -> List[int]:
+    """使用 NTT 计算 (a * b) mod (X^degree + 1, modulus)。"""
+    conv_len = 1
+    target = degree * 2
+    while conv_len < target:
+        conv_len <<= 1
+
+    root, inv_root = _get_ntt_roots(modulus, conv_len)
+    use_numpy = np is not None
+    if not use_numpy:
+        a_pad = list(a) + [0] * (conv_len - degree)
+        b_pad = list(b) + [0] * (conv_len - degree)
+    else:
+        a_pad = np.zeros(conv_len, dtype=np.int64)
+        b_pad = np.zeros(conv_len, dtype=np.int64)
+        a_pad[:degree] = a
+        b_pad[:degree] = b
+
+    if use_numpy:
+        _ntt_inplace_numpy(a_pad, modulus, root)
+        _ntt_inplace_numpy(b_pad, modulus, root)
+        a_pad = (a_pad * b_pad) % modulus
+        _ntt_inplace_numpy(a_pad, modulus, inv_root)
+        inv_len = pow(conv_len, modulus - 2, modulus)
+        a_pad = (a_pad * inv_len) % modulus
+        coeff_source = a_pad.tolist()
+    else:
+        _ntt_inplace(a_pad, modulus, root)
+        _ntt_inplace(b_pad, modulus, root)
+        for idx in range(conv_len):
+            a_pad[idx] = (a_pad[idx] * b_pad[idx]) % modulus
+
+        _ntt_inplace(a_pad, modulus, inv_root)
+        inv_len = pow(conv_len, modulus - 2, modulus)
+        for idx in range(conv_len):
+            a_pad[idx] = (a_pad[idx] * inv_len) % modulus
+        coeff_source = a_pad
+
+    result = coeff_source[:degree]
+    for idx in range(degree, min(2 * degree, conv_len)):
+        coeff = coeff_source[idx]
+        if coeff:
+            result[idx - degree] = (result[idx - degree] - coeff) % modulus
+    return result
+
+
+def _negacyclic_naive_convolution(
+    a: Sequence[int],
+    b: Sequence[int],
+    modulus: int,
+    degree: int,
+) -> List[int]:
+    """朴素的 O(n^2) 卷积实现 (X^n + 1) 模。"""
+    result = [0] * degree
+    for i, coeff_a in enumerate(a):
+        if coeff_a == 0:
+            continue
+        for j, coeff_b in enumerate(b):
+            if coeff_b == 0:
+                continue
+            deg = i + j
+            product = (coeff_a * coeff_b) % modulus
+            if deg < degree:
+                result[deg] = (result[deg] + product) % modulus
+            else:
+                idx = deg - degree
+                result[idx] = (result[idx] - product) % modulus
+    return result
 
 
 class PolyR:
@@ -128,22 +338,29 @@ class PolyR:
         """支持多项式卷积乘法或整数标量乘法。"""
         if isinstance(other, PolyR):
             self._check(other)
-            result = [0] * self.degree
-            for i, a in enumerate(self.coeffs):
-                if a == 0:
-                    continue
-                for j, b in enumerate(other.coeffs):
-                    if b == 0:
-                        continue
-                    deg = i + j
-                    product = (a * b) % self.modulus
-                    if deg < self.degree:
-                        result[deg] = (result[deg] + product) % self.modulus
-                    else:
-                        # X^{n+k} ≡ -X^k modulo X^n + 1
-                        idx = deg - self.degree
-                        result[idx] = (result[idx] - product) % self.modulus
-            return PolyR(result, self.modulus, self.degree)
+            if self.degree <= _NTT_NAIVE_THRESHOLD:
+                coeffs = _negacyclic_naive_convolution(
+                    self.coeffs,
+                    other.coeffs,
+                    self.modulus,
+                    self.degree,
+                )
+            else:
+                try:
+                    coeffs = _negacyclic_ntt_convolution(
+                        self.coeffs,
+                        other.coeffs,
+                        self.modulus,
+                        self.degree,
+                    )
+                except ValueError:
+                    coeffs = _negacyclic_naive_convolution(
+                        self.coeffs,
+                        other.coeffs,
+                        self.modulus,
+                        self.degree,
+                    )
+            return PolyR(coeffs, self.modulus, self.degree)
         elif isinstance(other, int):
             scalar = other % self.modulus
             return PolyR([(scalar * c) % self.modulus for c in self.coeffs], self.modulus, self.degree)
@@ -420,7 +637,7 @@ class CryptoManager:
     @staticmethod
     def encrypt_data(data: dict, key: bytes) -> Tuple[bytes, bytes]:
         """使用AES-GCM加密数据 / Encrypt serialized data with AES-GCM."""
-        aesgcm = AESGCM(key)
+        aesgcm = AESGCMImpl(key)
         nonce = os.urandom(12)
         serialized_data = json.dumps(data).encode()
         ciphertext = aesgcm.encrypt(nonce, serialized_data, None)
@@ -429,54 +646,45 @@ class CryptoManager:
     @staticmethod
     def decrypt_data(ciphertext: bytes, nonce: bytes, key: bytes) -> dict:
         """使用AES-GCM解密数据 / Decrypt ciphertext produced by AES-GCM."""
-        aesgcm = AESGCM(key)
+        aesgcm = AESGCMImpl(key)
         plaintext = aesgcm.decrypt(nonce, ciphertext, None)
         return json.loads(plaintext.decode())
 
     # —— KEM 与签名相关工具 ——
 
     @staticmethod
-    def generate_signature_keypair() -> Tuple[ed25519.Ed25519PrivateKey, bytes]:
+    def generate_signature_keypair() -> Tuple[Ed25519PrivateKey, bytes]:
         """生成Ed25519签名密钥对 / Generate an Ed25519 signing key pair."""
-        private_key = ed25519.Ed25519PrivateKey.generate()
-        public_key = private_key.public_key().public_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PublicFormat.Raw,
-        )
+        private_key = Ed25519PrivateKey.generate()
+        public_key = private_key.public_key().public_bytes()
         return private_key, public_key
 
     @staticmethod
-    def generate_kem_keypair() -> Tuple[x25519.X25519PrivateKey, bytes]:
+    def generate_kem_keypair() -> Tuple[X25519PrivateKey, bytes]:
         """生成X25519密钥对用于KEM封装 / Generate an X25519 key pair for KEM encapsulation."""
-        private_key = x25519.X25519PrivateKey.generate()
-        public_key = private_key.public_key().public_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PublicFormat.Raw,
-        )
+        private_key = X25519PrivateKey.generate()
+        public_key = private_key.public_key().public_bytes()
         return private_key, public_key
 
     @staticmethod
     def encapsulate_key(receiver_public_bytes: bytes, context: bytes) -> Tuple[bytes, bytes]:
         """使用接收者公钥封装对称密钥，返回(对称密钥, 发送方临时公钥)."""
-        receiver_public = x25519.X25519PublicKey.from_public_bytes(receiver_public_bytes)
-        ephemeral_private = x25519.X25519PrivateKey.generate()
+        receiver_public = X25519PublicKey.from_public_bytes(receiver_public_bytes)
+        ephemeral_private = X25519PrivateKey.generate()
         shared_secret = ephemeral_private.exchange(receiver_public)
         symmetric_key = CryptoManager._derive_symmetric_key(shared_secret, context)
-        ephemeral_public_bytes = ephemeral_private.public_key().public_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PublicFormat.Raw,
-        )
+        ephemeral_public_bytes = ephemeral_private.public_key().public_bytes()
         return symmetric_key, ephemeral_public_bytes
 
     @staticmethod
-    def decapsulate_key(ephemeral_public_bytes: bytes, receiver_private: x25519.X25519PrivateKey, context: bytes) -> bytes:
+    def decapsulate_key(ephemeral_public_bytes: bytes, receiver_private: X25519PrivateKey, context: bytes) -> bytes:
         """解封装对称密钥 / Decapsulate the symmetric key using receiver's private key."""
-        ephemeral_public = x25519.X25519PublicKey.from_public_bytes(ephemeral_public_bytes)
+        ephemeral_public = X25519PublicKey.from_public_bytes(ephemeral_public_bytes)
         shared_secret = receiver_private.exchange(ephemeral_public)
         return CryptoManager._derive_symmetric_key(shared_secret, context)
 
     @staticmethod
-    def sign_message(message: bytes, signing_private: ed25519.Ed25519PrivateKey) -> bytes:
+    def sign_message(message: bytes, signing_private: Ed25519PrivateKey) -> bytes:
         """对消息进行签名 / Sign a message with Ed25519."""
         return signing_private.sign(message)
 
@@ -484,7 +692,7 @@ class CryptoManager:
     def verify_signature(signature: bytes, message: bytes, signing_public_bytes: bytes) -> bool:
         """验证Ed25519签名，返回是否有效."""
         try:
-            public_key = ed25519.Ed25519PublicKey.from_public_bytes(signing_public_bytes)
+            public_key = Ed25519PublicKey.from_public_bytes(signing_public_bytes)
             public_key.verify(signature, message)
             return True
         except InvalidSignature:
@@ -534,97 +742,206 @@ class CryptoManager:
     @staticmethod
     def _derive_symmetric_key(shared_secret: bytes, context: bytes) -> bytes:
         """通过HKDF从共享秘密导出对称密钥."""
-        hkdf = HKDF(
-            algorithm=hashes.SHA256(),
-            length=32,
-            salt=None,
-            info=context or CryptoManager.KEM_INFO,
-            backend=default_backend(),
-        )
-        return hkdf.derive(shared_secret)
+        info = context or CryptoManager.KEM_INFO
+        return hkdf_sha256(shared_secret, length=32, salt=None, info=info)
 
 class NetworkSimulator:
-    """网络模拟器，用于参与者之间的通信"""
-    
-    def __init__(self):
-        """初始化消息队列、伪网络延迟及各类公钥表，用于模拟真实网络环境。"""
+    """利用 asyncio + 实际 TCP 端口模拟去中心化节点通信。"""
+
+    class NetworkEndpoint(threading.Thread):
+        """每个参与者独立的通信线程，负责监听端口并通过 asyncio 处理 I/O。"""
+
+        def __init__(self, participant_id: int, host: str, port: int, inbound_queue: Queue):
+            super().__init__(
+                name=f"NetworkEndpoint-P{participant_id}",
+                daemon=True,
+            )
+            self.participant_id = participant_id
+            self.host = host
+            self.port = port
+            self.inbound_queue = inbound_queue
+            self.loop = asyncio.new_event_loop()
+            self._server: Optional[asyncio.AbstractServer] = None
+            self._ready = threading.Event()
+
+        async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            try:
+                header = await reader.readexactly(4)
+                length = int.from_bytes(header, "big")
+                payload = await reader.readexactly(length)
+                message = pickle.loads(payload)
+                self.inbound_queue.put(message)
+            except asyncio.IncompleteReadError:
+                pass
+            except Exception as exc:  # noqa: BLE001 - 记录异常但不中断服务
+                print(f"[NetworkSimulator] Endpoint P{self.participant_id} handler error: {exc}")
+            finally:
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+
+        async def _serve(self) -> None:
+            try:
+                self._server = await asyncio.start_server(
+                    self._handle_client,
+                    self.host,
+                    self.port,
+                )
+                self._ready.set()
+                await self._server.serve_forever()
+            except Exception as exc:
+                self._ready.set()
+                print(f"[NetworkSimulator] Endpoint P{self.participant_id} failed to start: {exc}")
+
+        async def _send(self, target_host: str, target_port: int, payload: bytes) -> None:
+            last_exc: Optional[Exception] = None
+            for attempt in range(5):
+                try:
+                    reader, writer = await asyncio.open_connection(target_host, target_port)
+                    writer.write(len(payload).to_bytes(4, "big") + payload)
+                    await writer.drain()
+                    writer.close()
+                    await writer.wait_closed()
+                    return
+                except OSError as exc:
+                    last_exc = exc
+                    await asyncio.sleep(0.01 * (attempt + 1))
+            if last_exc:
+                raise last_exc
+
+        def send(self, target_host: str, target_port: int, payload: bytes) -> None:
+            if not self._ready.wait(timeout=5):
+                raise RuntimeError(f"Endpoint P{self.participant_id} is not ready to send data")
+            future = asyncio.run_coroutine_threadsafe(
+                self._send(target_host, target_port, payload),
+                self.loop,
+            )
+            future.result()
+
+        def wait_ready(self, timeout: float = 2.0) -> bool:
+            return self._ready.wait(timeout)
+
+        def stop(self) -> None:
+            def _shutdown() -> None:
+                if self._server is not None:
+                    self._server.close()
+                for task in asyncio.all_tasks(self.loop):
+                    task.cancel()
+                self.loop.stop()
+
+            self.loop.call_soon_threadsafe(_shutdown)
+
+        def run(self) -> None:
+            asyncio.set_event_loop(self.loop)
+            self.loop.create_task(self._serve())
+            try:
+                self.loop.run_forever()
+            finally:
+                try:
+                    self.loop.run_until_complete(self.loop.shutdown_asyncgens())
+                except Exception:
+                    pass
+                self.loop.close()
+
+    def __init__(self, base_host: str = "127.0.0.1", base_port: int = 9000):
         self.message_queues: Dict[int, Queue] = {}
         self.lock = threading.Lock()
         self.signing_public_keys: Dict[int, bytes] = {}
         self.kem_public_keys: Dict[int, bytes] = {}
-        self.network_delay: float = 0.015  # 每条消息的模拟延时 (15ms)
+        self.base_host = base_host
+        self.base_port = base_port
+        self.node_addresses: Dict[int, Tuple[str, int]] = {}
+        self.nodes: Dict[int, NetworkSimulator.NetworkEndpoint] = {}
 
-    def _enqueue_message(self, participant_id: int, msg_type: str, payload) -> None:
-        """在持锁状态下获取目标队列并投递消息，附带可调的网络延迟。"""
-        queue = None
-        with self.lock:
-            queue = self.message_queues.get(participant_id)
-        if queue is None:
-            return
-        time.sleep(self.network_delay)
-        queue.put((msg_type, payload))
+    def _serialize_message(self, msg_type: str, payload: Any) -> bytes:
+        return pickle.dumps((msg_type, payload), protocol=pickle.HIGHEST_PROTOCOL)
 
     def _all_participant_ids(self) -> List[int]:
-        """返回当前已注册的参与者 ID 列表，供广播使用。"""
         with self.lock:
             return list(self.message_queues.keys())
-    
+
+    def _send_message(self, sender_id: int, participant_id: int, msg_type: str, payload: Any) -> None:
+        with self.lock:
+            sender_node = self.nodes.get(sender_id)
+            target_addr = self.node_addresses.get(participant_id)
+        if sender_node is None or target_addr is None:
+            return
+        message_bytes = self._serialize_message(msg_type, payload)
+        sender_node.send(target_addr[0], target_addr[1], message_bytes)
+
+    def _broadcast(self, sender_id: int, msg_type: str, payload: Any) -> None:
+        for participant_id in self._all_participant_ids():
+            self._send_message(sender_id, participant_id, msg_type, payload)
+
     def register_participant(
         self,
         participant_id: int,
         signing_public_key: Optional[bytes] = None,
         kem_public_key: Optional[bytes] = None,
     ) -> None:
-        """注册参与者并记录其公钥"""
+        endpoint_to_start: Optional[NetworkSimulator.NetworkEndpoint] = None
         with self.lock:
             if participant_id not in self.message_queues:
                 self.message_queues[participant_id] = Queue()
+            if participant_id not in self.node_addresses:
+                host = self.base_host
+                port = self.base_port + participant_id
+                self.node_addresses[participant_id] = (host, port)
+            else:
+                host, port = self.node_addresses[participant_id]
+
+            if participant_id not in self.nodes:
+                endpoint = NetworkSimulator.NetworkEndpoint(
+                    participant_id,
+                    host,
+                    port,
+                    self.message_queues[participant_id],
+                )
+                self.nodes[participant_id] = endpoint
+                endpoint_to_start = endpoint
+
             if signing_public_key is not None and kem_public_key is not None:
                 self.signing_public_keys[participant_id] = signing_public_key
                 self.kem_public_keys[participant_id] = kem_public_key
 
+        if endpoint_to_start is not None:
+            endpoint_to_start.start()
+            endpoint_to_start.wait_ready()
+
     def get_signing_public_key(self, participant_id: int) -> bytes:
-        """查询指定参与者的 Ed25519 公钥（用于验证签名）。"""
         with self.lock:
             return self.signing_public_keys[participant_id]
 
     def get_kem_public_key(self, participant_id: int) -> bytes:
-        """查询指定参与者的 X25519 公钥（用于 KEM 封装）。"""
         with self.lock:
             return self.kem_public_keys[participant_id]
-    
-    def send_encrypted_share(self, package: EncryptedSharePackage):
-        """发送加密份额"""
-        self._enqueue_message(package.receiver_id, 'share', package)
-    
-    def broadcast_proof(self, proof: PublicProof):
-        """广播公开证明"""
-        for participant_id in self._all_participant_ids():
-            self._enqueue_message(participant_id, 'proof', proof)
-    
-    def broadcast_complaint(self, complaint: Complaint):
-        """广播投诉消息"""
-        for participant_id in self._all_participant_ids():
-            self._enqueue_message(participant_id, 'complaint', complaint)
-    
-    def broadcast_aggregated_share(self, agg_share: 'AggregatedShare'):
-        """广播聚合份额"""
-        for participant_id in self._all_participant_ids():
-            self._enqueue_message(participant_id, 'aggregated', agg_share)
 
-    def broadcast_validation_vector(self, validation: ValidationVector) -> None:
-        """广播本地验证结果"""
-        for participant_id in self._all_participant_ids():
-            self._enqueue_message(participant_id, 'validation', validation)
+    def send_encrypted_share(self, sender_id: int, package: EncryptedSharePackage) -> None:
+        self._send_message(sender_id, package.receiver_id, 'share', package)
 
-    def broadcast_global_public_key(self, leader_id: int, global_key: List[List[int]]) -> None:
-        """广播最终全局公钥，供所有参与者采信。"""
+    def broadcast_proof(self, sender_id: int, proof: PublicProof) -> None:
+        self._broadcast(sender_id, 'proof', proof)
+
+    def broadcast_complaint(self, sender_id: int, complaint: Complaint) -> None:
+        self._broadcast(sender_id, 'complaint', complaint)
+
+    def broadcast_aggregated_share(self, sender_id: int, agg_share: 'AggregatedShare') -> None:
+        self._broadcast(sender_id, 'aggregated', agg_share)
+
+    def broadcast_validation_vector(self, sender_id: int, validation: ValidationVector) -> None:
+        self._broadcast(sender_id, 'validation', validation)
+
+    def broadcast_global_public_key(self, sender_id: int, leader_id: int, global_key: List[List[int]]) -> None:
         payload = {
             'leader_id': leader_id,
             'global_public_key': global_key,
         }
-        for participant_id in self._all_participant_ids():
-            self._enqueue_message(participant_id, 'global_key', payload)
+        self._broadcast(sender_id, 'global_key', payload)
+
+    def broadcast_partial_public_key(self, sender_id: int, message: Dict[str, Any]) -> None:
+        self._broadcast(sender_id, 'partial_key', message)
     
     def receive_encrypted_shares(self, participant_id: int, timeout: float = 5.0) -> List[EncryptedSharePackage]:
         """接收加密份额"""
@@ -903,20 +1220,37 @@ class V3S:
     def generate_random_matrix(self, rows: int, cols: int, seed: str) -> MatrixR:
         """通过 SHAKE-128 流生成确定性的随机环矩阵，用于公共参数。"""
         coeffs_needed = rows * cols * self.ring_degree
-        byte_len = coeffs_needed * 2
+        bits_needed = coeffs_needed * 2  # 每个系数需要两个随机比特
+        byte_len = (bits_needed + 7) // 8
         shake = hashlib.shake_128(seed.encode())
         random_bytes = shake.digest(byte_len)
 
         matrix: MatrixR = []
-        cursor = 0
+        bit_cursor = 0
+        total_bits = byte_len * 8
+
+        def next_bit() -> int:
+            nonlocal bit_cursor
+            if bit_cursor >= total_bits:
+                raise ValueError("Insufficient randomness for matrix generation")
+            byte_index = bit_cursor // 8
+            bit_offset = bit_cursor % 8
+            bit_cursor += 1
+            return (random_bytes[byte_index] >> bit_offset) & 1
+
         for i in range(rows):
             row: List[PolyR] = []
             for _ in range(cols):
                 coeffs = []
                 for _ in range(self.ring_degree):
-                    coeff_bytes = random_bytes[cursor: cursor + 2]
-                    cursor += 2
-                    coeff = int.from_bytes(coeff_bytes, "little") % self.prime
+                    bit_a = next_bit()
+                    bit_b = next_bit()
+                    if bit_a == bit_b:
+                        coeff = 0  # 00 或 11，对应 0
+                    elif bit_a == 0 and bit_b == 1:
+                        coeff = 1  # 01 -> 1
+                    else:
+                        coeff = self.prime - 1  # 10 -> -1 (mod q)
                     coeffs.append(coeff)
                 row.append(PolyR(coeffs, self.prime, self.ring_degree))
             matrix.append(row)
@@ -1511,7 +1845,7 @@ class DistributedParticipant(threading.Thread):
             package.signature = signature
             signature_ops += 1
 
-            self.network.send_encrypted_share(package)
+            self.network.send_encrypted_share(self.participant_id, package)
             shares_sent += 1
 
         self.network_send_time = time.time() - send_start_time
@@ -1543,7 +1877,7 @@ class DistributedParticipant(threading.Thread):
             spectral_norm=self.public_proof['spectral_norm']
         )
         
-        self.network.broadcast_proof(proof)
+        self.network.broadcast_proof(self.participant_id, proof)
         
         broadcast_time = time.time() - broadcast_start_time
         self.network_send_time += broadcast_time
@@ -1606,7 +1940,7 @@ class DistributedParticipant(threading.Thread):
                         complainer_signature=complaint_signature,
                         sender_key_signature=package.key_signature,
                     )
-                    self.network.broadcast_complaint(complaint)
+                    self.network.broadcast_complaint(self.participant_id, complaint)
                     self.complaints_sent.append(complaint)
                     print(
                         f"[Participant {self.participant_id}] ✗ Invalid key signature on share from Participant {package.sender_id}"
@@ -1638,7 +1972,7 @@ class DistributedParticipant(threading.Thread):
                         complainer_signature=complaint_signature,
                         sender_key_signature=package.key_signature,
                     )
-                    self.network.broadcast_complaint(complaint)
+                    self.network.broadcast_complaint(self.participant_id, complaint)
                     self.complaints_sent.append(complaint)
                     print(
                         f"[Participant {self.participant_id}] ✗ Invalid signature on share from Participant {package.sender_id}"
@@ -1752,7 +2086,7 @@ class DistributedParticipant(threading.Thread):
                         complainer_signature=complaint_signature,
                         sender_key_signature=getattr(package, "key_signature", None),
                     )
-                    self.network.broadcast_complaint(complaint)
+                    self.network.broadcast_complaint(self.participant_id, complaint)
                     self.complaints_sent.append(complaint)
                     print(
                         f"[Participant {self.participant_id}] ✗ Failed to verify share from Participant {proof.participant_id}"
@@ -1891,7 +2225,7 @@ class DistributedParticipant(threading.Thread):
         )
 
         send_start = time.time()
-        self.network.broadcast_validation_vector(validation_vector)
+        self.network.broadcast_validation_vector(self.participant_id, validation_vector)
         broadcast_duration = time.time() - send_start
         self.network_send_time += broadcast_duration
         self.network_ops['广播验证结果 (valid_i 集合)'] = 1
@@ -2031,17 +2365,23 @@ class DistributedParticipant(threading.Thread):
         start_time = time.time()
 
         matrix_size = self.d * self.d
-        bytes_needed = matrix_size * 4
+        coeffs_per_poly = self.v3s.ring_degree
+        bytes_per_coeff = 2
+        bytes_needed = matrix_size * coeffs_per_poly * bytes_per_coeff
         random_bytes = hashlib.shake_256(self.consensus_salt.encode()).digest(bytes_needed)
 
         A: MatrixR = []
+        byte_cursor = 0
         for i in range(self.d):
             row: List[PolyR] = []
             for j in range(self.d):
-                byte_idx = (i * self.d + j) * 4
-                value = int.from_bytes(random_bytes[byte_idx:byte_idx+4], byteorder='big') % self.v3s.prime
-                coeffs = [0] * self.v3s.ring_degree
-                coeffs[0] = value
+                coeffs = [0] * coeffs_per_poly
+                for k in range(coeffs_per_poly):
+                    chunk = random_bytes[byte_cursor:byte_cursor + bytes_per_coeff]
+                    if len(chunk) < bytes_per_coeff:
+                        chunk = chunk.ljust(bytes_per_coeff, b"\x00")
+                    coeffs[k] = int.from_bytes(chunk, "big") % self.v3s.prime
+                    byte_cursor += bytes_per_coeff
                 row.append(poly_from_coeffs(coeffs, self.v3s.prime, self.v3s.ring_degree))
             A.append(row)
 
@@ -2070,9 +2410,7 @@ class DistributedParticipant(threading.Thread):
             'participant_id': self.participant_id,
             'partial_public_key': self.partial_public_key,
         }
-        with self.network.lock:
-            for pid in self.network.message_queues.keys():
-                self.network.message_queues[pid].put(('partial_key', partial_key_message))
+        self.network.broadcast_partial_public_key(self.participant_id, partial_key_message)
         broadcast_time = time.time() - broadcast_start
         print(f"[Participant {self.participant_id}] Broadcasted partial public key ({broadcast_time*1000:.2f} ms)")
 
@@ -2104,7 +2442,11 @@ class DistributedParticipant(threading.Thread):
             self.global_public_key = vector_to_coeff_lists(global_public_key_vec)
 
             broadcast_global_start = time.time()
-            self.network.broadcast_global_public_key(self.participant_id, self.global_public_key)
+            self.network.broadcast_global_public_key(
+                self.participant_id,
+                self.participant_id,
+                self.global_public_key,
+            )
             broadcast_global_time = time.time() - broadcast_global_start
             print(
                 f"[Participant {self.participant_id}] ✓ Reconstructed global public key via RS ({reconstruction_time*1000:.2f} ms)"
@@ -2121,7 +2463,7 @@ class DistributedParticipant(threading.Thread):
         ops_receive = len(received_partial_keys) - 1 if received_partial_keys else 0
         pub_ops = {
             "SHAKE-256字节 (生成矩阵A)": bytes_needed,
-            "矩阵生成 (PolyR常量项)": self.d * self.d,
+            "矩阵生成 (PolyR全系数)": self.d * self.d,
             "环上乘法 (A×share_i)": self.d * self.d,
             "部分公钥广播": 1,
         }
@@ -2537,4 +2879,9 @@ def test_distributed_v3s():
 
 if __name__ == "__main__":
     setup_run_logger()
+    print(
+        f"[Crypto] AES backend: {AES_BACKEND} (source: {AESCIPHER_SOURCE})"
+    )
+    if TONGSUO_LOAD_ERROR:
+        print(f"[Crypto] Warning: failed to load Tongsuo backend: {TONGSUO_LOAD_ERROR}")
     test_distributed_v3s()
